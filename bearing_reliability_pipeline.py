@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""
+Полный расчётный пайплайн: от решателя Рейнольдса до оценки надёжности.
+
+Этап 1: Коэффициенты жёсткости/демпфирования K, C (8 штук)
+Этап 2: Интегрирование орбиты ротора
+Этап 3: Нагрузка на опору P(t)
+Этап 4: Ресурс и надёжность по Лундбергу–Палмгрену
+
+Сравнение: гладкий подшипник vs эллипсоидальная текстура.
+"""
+
+import os
+import warnings
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from reynolds_solver import solve_reynolds
+from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
+
+# ──────────────────────────────────────────────────────────────────────
+# Конфигурация (все физические параметры)
+# ──────────────────────────────────────────────────────────────────────
+
+# --- Геометрия ---
+R = 0.035          # Радиус подшипника, м
+c = 0.00005        # Радиальный зазор, м
+L = 0.056          # Длина подшипника, м
+
+# --- Режим работы ---
+n_rpm = 2980                              # Скорость вращения, об/мин
+omega_shaft = 2 * np.pi * n_rpm / 60      # Угловая скорость, рад/с
+U = omega_shaft * (R - c)                 # Линейная скорость на валу, м/с
+eta = 0.01105                             # Динамическая вязкость, Па·с
+
+# --- Текстура ---
+h_p = 0.00001      # Глубина углубления, м
+H_p = h_p / c      # Безразмерная глубина
+a_tex = 0.00241    # Полуось по Z, м
+b_tex = 0.002214   # Полуось по φ, м
+A_tex = 2 * a_tex / L   # Безразмерная полуось по Z
+B_tex = b_tex / R        # Безразмерная полуось по φ
+
+# --- Расположение углублений ---
+N_phi_tex = 8       # Количество углублений по φ  (НЕ путать с num_phi_points!)
+N_Z_tex = 11        # Количество углублений по Z   (НЕ путать с num_Z_points!)
+phi_start_deg = 90
+phi_end_deg = 270
+
+# --- Масштабы ---
+pressure_scale = (6 * eta * U * R) / (c ** 2)
+load_scale = pressure_scale * (R * L) / 2
+
+psi = c / R
+K_scale = eta * omega_shaft * L / psi ** 3    # Н/м
+C_scale = eta * L / psi ** 3                  # Н·с/м
+
+# --- Сетка ---
+# 200x200 for reasonable runtime; increase to 500x500 for publication quality
+num_phi_points = 200
+num_Z_points = 200
+
+phi_1D = np.linspace(0, 2 * np.pi, num_phi_points, endpoint=False)
+Z = np.linspace(-1, 1, num_Z_points)
+d_phi = 2 * np.pi / num_phi_points
+d_Z = Z[1] - Z[0]
+
+Phi_mesh, Z_mesh = np.meshgrid(phi_1D, Z)
+cos_phi_mesh = np.cos(Phi_mesh)
+sin_phi_mesh = np.sin(Phi_mesh)
+
+# --- Параметр SOR (НЕ путать с omega_shaft!) ---
+omega_sor = 1.5
+
+# --- Координаты центров углублений ---
+phi_c_arr = np.linspace(np.radians(phi_start_deg), np.radians(phi_end_deg), N_phi_tex)
+Z_c_arr = np.linspace(-1 + A_tex, 1 - A_tex, N_Z_tex)
+phi_c_grid, Z_c_grid = np.meshgrid(phi_c_arr, Z_c_arr)
+phi_c_flat = phi_c_grid.ravel()
+Z_c_flat = Z_c_grid.ravel()
+
+# --- Параметры Лундберга–Палмгрена ---
+C_bearing = 50000.0   # Динамическая грузоподъёмность, Н
+p_lp = 3              # 3 — шариковые
+beta_weibull = 1.5    # Параметр формы Вейбулла
+
+# --- Параметры орбиты ---
+m_rotor = 1.0         # масса ротора, кг
+F0 = 1.0e4            # амплитуда внешней силы, Н
+Omega = omega_shaft    # возмущающая частота
+
+# --- Параметры возмущений ---
+de = 5e-4             # для жёсткости
+dv = 5e-4             # для демпфирования
+
+# --- Диапазон эксцентриситетов ---
+epsilon_values = np.linspace(0.2, 0.8, 10)
+epsilon0_operating = 0.6   # рабочая точка
+
+# --- Директория для графиков ---
+PLOT_DIR = "plots"
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Solver adapter
+# ──────────────────────────────────────────────────────────────────────
+
+def solver_adapter(ex, ey, exdot_star=0.0, eydot_star=0.0,
+                   with_depressions=False):
+    """
+    Формирует зазор H(ex, ey), решает Рейнольдса, возвращает силы.
+
+    КРИТИЧЕСКИ ВАЖНО: перестановка xprime <-> eydot!
+      В решателе: F_dyn = xprime * sin(φ) + yprime * cos(φ)
+      Зазор:      H = 1 + ex * cos(φ) + ey * sin(φ)
+      Поэтому:
+        ėx (при cos) -> yprime в решателе
+        ėy (при sin) -> xprime в решателе
+
+    Parameters
+    ----------
+    ex, ey : float
+        Компоненты эксцентриситета.
+    exdot_star, eydot_star : float
+        Безразмерные скорости (для коэффициентов демпфирования).
+    with_depressions : bool
+        Добавлять текстуру.
+
+    Returns
+    -------
+    Fx_dim, Fy_dim : float
+        Размерные силы [Н].
+    diag : dict
+        Диагностика (n_iter, delta, P_max).
+    """
+    # Базовый зазор
+    H0 = 1.0 + ex * cos_phi_mesh + ey * sin_phi_mesh
+
+    # Текстура
+    if with_depressions:
+        H = create_H_with_ellipsoidal_depressions(
+            H0, H_p, Phi_mesh, Z_mesh, phi_c_flat, Z_c_flat, A_tex, B_tex
+        )
+    else:
+        H = H0.copy()
+
+    # ПЕРЕСТАНОВКА: exdot -> yprime, eydot -> xprime
+    P, delta, n_iter = solve_reynolds(
+        H, d_phi, d_Z, R, L,
+        omega=omega_sor,
+        xprime=eydot_star,
+        yprime=exdot_star
+    )
+
+    # Интегрирование давления -> силы (безразмерные)
+    Fx_nd = np.trapezoid(np.trapezoid(P * cos_phi_mesh, phi_1D, axis=1), Z)
+    Fy_nd = np.trapezoid(np.trapezoid(P * sin_phi_mesh, phi_1D, axis=1), Z)
+
+    # Размерные силы
+    Fx_dim = Fx_nd * load_scale
+    Fy_dim = Fy_nd * load_scale
+
+    diag = {
+        "n_iter": n_iter,
+        "delta": delta,
+        "P_max": float(np.max(P)),
+    }
+
+    return Fx_dim, Fy_dim, diag
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Compute K, C (8 коэффициентов)
+# ──────────────────────────────────────────────────────────────────────
+
+def compute_KC(epsilon, with_depressions=False, de_val=None, dv_val=None):
+    """
+    Вычислить 8 коэффициентов жёсткости и демпфирования.
+
+    Конвенция знаков (восстанавливающие):
+        K_ij = -dF_i / dq_j
+        C_ij = -dF_i / dq̇_j
+
+    Parameters
+    ----------
+    epsilon : float
+        Статический эксцентриситет (ex0 = epsilon, ey0 = 0).
+    with_depressions : bool
+        С текстурой или без.
+    de_val, dv_val : float or None
+        Размер возмущения. По умолчанию из глобального конфига.
+
+    Returns
+    -------
+    coef : dict
+        Словарь с ключами Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy
+        (безразмерные — делённые на K_scale / C_scale).
+    coef_dim : dict
+        То же, но размерные (Н/м для K, Н·с/м для C).
+    diags : list of dict
+        Диагностика каждого решения.
+    """
+    if de_val is None:
+        de_val = de
+    if dv_val is None:
+        dv_val = dv
+
+    ex0 = epsilon
+    ey0 = 0.0
+
+    diags = []
+
+    # ─── Жёсткость: возмущение ex ± de ───
+    Fx_p, Fy_p, d1 = solver_adapter(ex0 + de_val, ey0, with_depressions=with_depressions)
+    Fx_m, Fy_m, d2 = solver_adapter(ex0 - de_val, ey0, with_depressions=with_depressions)
+    diags.extend([d1, d2])
+
+    # K_ij = -dF_i / dq_j ;  dq_j = de * c (размерное), здесь в безразмерных координатах
+    # Безразмерные силы уже умножены на load_scale, деление на 2*de дает dF/d(epsilon)
+    Kxx_star = -(Fx_p - Fx_m) / (2 * de_val)
+    Kyx_star = -(Fy_p - Fy_m) / (2 * de_val)
+
+    # ─── Жёсткость: возмущение ey ± de ───
+    Fx_p, Fy_p, d3 = solver_adapter(ex0, ey0 + de_val, with_depressions=with_depressions)
+    Fx_m, Fy_m, d4 = solver_adapter(ex0, ey0 - de_val, with_depressions=with_depressions)
+    diags.extend([d3, d4])
+
+    Kxy_star = -(Fx_p - Fx_m) / (2 * de_val)
+    Kyy_star = -(Fy_p - Fy_m) / (2 * de_val)
+
+    # ─── Демпфирование: возмущение ėx ± dv ───
+    # ėx -> yprime в решателе (ПЕРЕСТАНОВКА в solver_adapter)
+    Fx_p, Fy_p, d5 = solver_adapter(ex0, ey0, exdot_star=+dv_val, with_depressions=with_depressions)
+    Fx_m, Fy_m, d6 = solver_adapter(ex0, ey0, exdot_star=-dv_val, with_depressions=with_depressions)
+    diags.extend([d5, d6])
+
+    Cxx_star = -(Fx_p - Fx_m) / (2 * dv_val)
+    Cyx_star = -(Fy_p - Fy_m) / (2 * dv_val)
+
+    # ─── Демпфирование: возмущение ėy ± dv ───
+    # ėy -> xprime в решателе (ПЕРЕСТАНОВКА в solver_adapter)
+    Fx_p, Fy_p, d7 = solver_adapter(ex0, ey0, eydot_star=+dv_val, with_depressions=with_depressions)
+    Fx_m, Fy_m, d8 = solver_adapter(ex0, ey0, eydot_star=-dv_val, with_depressions=with_depressions)
+    diags.extend([d7, d8])
+
+    Cxy_star = -(Fx_p - Fx_m) / (2 * dv_val)
+    Cyy_star = -(Fy_p - Fy_m) / (2 * dv_val)
+
+    # ─── Перевод в размерные ───
+    # K: сила / de -> сила / (de * c) = K_dim [Н/м]
+    Kxx_dim = Kxx_star / c
+    Kxy_dim = Kxy_star / c
+    Kyx_dim = Kyx_star / c
+    Kyy_dim = Kyy_star / c
+
+    # C: сила / dv -> сила / (dv * c * omega_shaft) = C_dim [Н·с/м]
+    Cxx_dim = Cxx_star / (c * omega_shaft)
+    Cxy_dim = Cxy_star / (c * omega_shaft)
+    Cyx_dim = Cyx_star / (c * omega_shaft)
+    Cyy_dim = Cyy_star / (c * omega_shaft)
+
+    # ─── Безразмерные (делённые на масштаб) ───
+    Kxx_nd = Kxx_dim / K_scale
+    Kxy_nd = Kxy_dim / K_scale
+    Kyx_nd = Kyx_dim / K_scale
+    Kyy_nd = Kyy_dim / K_scale
+
+    Cxx_nd = Cxx_dim / C_scale
+    Cxy_nd = Cxy_dim / C_scale
+    Cyx_nd = Cyx_dim / C_scale
+    Cyy_nd = Cyy_dim / C_scale
+
+    coef_nd = {
+        "Kxx": Kxx_nd, "Kxy": Kxy_nd, "Kyx": Kyx_nd, "Kyy": Kyy_nd,
+        "Cxx": Cxx_nd, "Cxy": Cxy_nd, "Cyx": Cyx_nd, "Cyy": Cyy_nd,
+    }
+    coef_dim = {
+        "Kxx": Kxx_dim, "Kxy": Kxy_dim, "Kyx": Kyx_dim, "Kyy": Kyy_dim,
+        "Cxx": Cxx_dim, "Cxy": Cxy_dim, "Cyx": Cyx_dim, "Cyy": Cyy_dim,
+    }
+
+    return coef_nd, coef_dim, diags
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sanity checks
+# ──────────────────────────────────────────────────────────────────────
+
+def sanity_check_KC(coef_nd, label=""):
+    """Проверки физичности K, C."""
+    ok = True
+    for name in ["Kxx", "Kyy"]:
+        if coef_nd[name] <= 0:
+            warnings.warn(f"[{label}] {name} = {coef_nd[name]:.4e} <= 0  -- ПРОВЕРИТЬ КОНВЕНЦИИ!")
+            ok = False
+    for name in ["Cxx", "Cyy"]:
+        if coef_nd[name] <= 0:
+            warnings.warn(f"[{label}] {name} = {coef_nd[name]:.4e} <= 0  -- ПРОВЕРИТЬ КОНВЕНЦИИ!")
+            ok = False
+
+    # Проверка собственных значений симметричной части C
+    C_mat = np.array([[coef_nd["Cxx"], coef_nd["Cxy"]],
+                       [coef_nd["Cyx"], coef_nd["Cyy"]]])
+    C_sym = 0.5 * (C_mat + C_mat.T)
+    eigs = np.linalg.eigvalsh(C_sym)
+    if np.any(eigs <= 0):
+        warnings.warn(f"[{label}] Симм. часть C имеет неположит. собств. знач.: {eigs}")
+        ok = False
+
+    return ok
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Проверка стабильности δ
+# ──────────────────────────────────────────────────────────────────────
+
+def check_delta_stability(epsilon, with_depressions=False):
+    """Проверить, что коэффициенты устойчивы к изменению δ в 2 раза."""
+    coef1, _, _ = compute_KC(epsilon, with_depressions=with_depressions, de_val=de, dv_val=dv)
+    coef2, _, _ = compute_KC(epsilon, with_depressions=with_depressions, de_val=de / 2, dv_val=dv / 2)
+
+    print(f"\n{'='*60}")
+    print(f"Проверка стабильности δ (ε={epsilon}, text={'да' if with_depressions else 'нет'})")
+    print(f"{'Коэфф.':<8} {'δ':>12} {'δ/2':>12} {'Δ%':>8}")
+    print(f"{'-'*44}")
+
+    max_diff = 0.0
+    for key in coef1:
+        v1 = coef1[key]
+        v2 = coef2[key]
+        if abs(v1) > 1e-12:
+            diff_pct = abs(v2 - v1) / abs(v1) * 100
+        else:
+            diff_pct = 0.0
+        max_diff = max(max_diff, diff_pct)
+        print(f"{key:<8} {v1:>12.4f} {v2:>12.4f} {diff_pct:>7.1f}%")
+
+    status = "OK" if max_diff < 5 else "НУЖНА КОРРЕКЦИЯ δ"
+    print(f"\nМакс. отклонение: {max_diff:.1f}% — {status}")
+    return max_diff < 5
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Параметры устойчивости
+# ──────────────────────────────────────────────────────────────────────
+
+def compute_stability_params(Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy):
+    """Эквивалентная жёсткость, порог устойчивости, частота прецессии."""
+    denom = Cxx + Cyy
+    K_eq = (Kxx * Cyy + Kyy * Cxx - Kxy * Cyx - Kyx * Cxy) / denom
+    gamma_st2 = ((K_eq - Kxx) * (K_eq - Kyy) - Kxy * Kyx) / (Cxx * Cyy - Cxy * Cyx)
+    omega_st = K_eq / gamma_st2 if abs(gamma_st2) > 1e-30 else np.inf
+    return K_eq, gamma_st2, omega_st
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Этап 2: Интегрирование орбиты ротора
+# ──────────────────────────────────────────────────────────────────────
+
+def integrate_orbit(coef_nd, n_periods=40, pts_per_period=200):
+    """
+    Линейная модель ротора:
+        m·ẍ = F_ext_x(t) - Kxx·x - Kxy·y - Cxx·ẋ - Cxy·ẏ
+        m·ÿ = F_ext_y(t) - Kyx·x - Kyy·y - Cyx·ẋ - Cyy·ẏ
+
+    В безразмерном виде (t* = Ω·t, x* = x/c):
+        m_nd · x'' = F_nd·cos(t*) - K·x* - C·x*'
+
+    Returns
+    -------
+    sol : OdeSolution
+    """
+    m_nd = m_rotor * Omega ** 2 / K_scale
+    F_nd = F0 / (K_scale * c)
+
+    def rotor_ode(t_star, state):
+        x, y, vx, vy = state
+        Fx_ext = F_nd * np.cos(t_star)
+        Fy_ext = F_nd * np.sin(t_star)
+        ax = (Fx_ext
+              - coef_nd["Kxx"] * x - coef_nd["Kxy"] * y
+              - coef_nd["Cxx"] * vx - coef_nd["Cxy"] * vy) / m_nd
+        ay = (Fy_ext
+              - coef_nd["Kyx"] * x - coef_nd["Kyy"] * y
+              - coef_nd["Cyx"] * vx - coef_nd["Cyy"] * vy) / m_nd
+        return [vx, vy, ax, ay]
+
+    t_max = n_periods * 2 * np.pi
+    t_eval = np.linspace(0, t_max, n_periods * pts_per_period)
+
+    sol = solve_ivp(
+        rotor_ode, (0, t_max), [0.0, 0.0, 0.0, 0.0],
+        method="BDF", rtol=1e-8, atol=1e-10, t_eval=t_eval
+    )
+
+    return sol
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Собственные значения системы (проверка устойчивости)
+# ──────────────────────────────────────────────────────────────────────
+
+def compute_eigenvalues(coef_nd):
+    """
+    Собственные значения линейной системы ротора.
+    Матрица системы 4x4: state = [x, y, vx, vy]
+    """
+    m_nd = m_rotor * Omega ** 2 / K_scale
+
+    A_sys = np.array([
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
+        [-coef_nd["Kxx"] / m_nd, -coef_nd["Kxy"] / m_nd,
+         -coef_nd["Cxx"] / m_nd, -coef_nd["Cxy"] / m_nd],
+        [-coef_nd["Kyx"] / m_nd, -coef_nd["Kyy"] / m_nd,
+         -coef_nd["Cyx"] / m_nd, -coef_nd["Cyy"] / m_nd],
+    ])
+
+    eigs = np.linalg.eigvals(A_sys)
+    return eigs
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Этап 3: Нагрузка на опору P(t)
+# ──────────────────────────────────────────────────────────────────────
+
+def compute_bearing_load(sol, coef_dim):
+    """
+    Из орбиты → реакция опоры P(t).
+
+    x_dim = x_nd * c, xdot_dim = vx_nd * c * Omega
+    """
+    x_dim = sol.y[0] * c
+    y_dim = sol.y[1] * c
+    xdot_dim = sol.y[2] * c * Omega
+    ydot_dim = sol.y[3] * c * Omega
+
+    Fx_b = (coef_dim["Kxx"] * x_dim + coef_dim["Kxy"] * y_dim
+            + coef_dim["Cxx"] * xdot_dim + coef_dim["Cxy"] * ydot_dim)
+    Fy_b = (coef_dim["Kyx"] * x_dim + coef_dim["Kyy"] * y_dim
+            + coef_dim["Cyx"] * xdot_dim + coef_dim["Cyy"] * ydot_dim)
+
+    P_bearing = np.sqrt(Fx_b ** 2 + Fy_b ** 2)
+    return P_bearing, Fx_b, Fy_b
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Этап 4: Лундберг–Палмгрен
+# ──────────────────────────────────────────────────────────────────────
+
+def compute_Peq(P_bearing, t_nd, transient_fraction=0.2):
+    """Эквивалентная нагрузка P_eq (отбросив переходный процесс)."""
+    t_cut = transient_fraction * t_nd[-1]
+    mask = t_nd > t_cut
+    P_steady = P_bearing[mask]
+    P_eq = (np.mean(P_steady ** p_lp)) ** (1.0 / p_lp)
+    return P_eq
+
+
+def compute_L10(P_eq):
+    """Ресурс L10 в оборотах и часах."""
+    L10_rev = (C_bearing / P_eq) ** p_lp * 1e6
+    L10h = L10_rev / (60 * n_rpm)
+    return L10_rev, L10h
+
+
+def weibull_reliability(L10h, t_hours=None):
+    """Кривая надёжности R(t) по Вейбуллу."""
+    eta_wb = L10h / (-np.log(0.9)) ** (1.0 / beta_weibull)
+    if t_hours is None:
+        t_hours = np.linspace(0, 5 * L10h, 1000)
+    R = np.exp(-(t_hours / eta_wb) ** beta_weibull)
+    return t_hours, R
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Построение графиков
+# ──────────────────────────────────────────────────────────────────────
+
+def plot_KC_vs_epsilon(eps_arr, KC_smooth, KC_textured, save=True):
+    """8 графиков K_ij(ε) и C_ij(ε) — гладкий vs текстура."""
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+    names_K = ["Kxx", "Kxy", "Kyx", "Kyy"]
+    names_C = ["Cxx", "Cxy", "Cyx", "Cyy"]
+
+    for idx, name in enumerate(names_K):
+        ax = axes[0, idx]
+        ax.plot(eps_arr, [kc[name] for kc in KC_smooth], "b-o", label="Гладкий", markersize=4)
+        ax.plot(eps_arr, [kc[name] for kc in KC_textured], "r-s", label="Текстура", markersize=4)
+        ax.set_xlabel("ε")
+        ax.set_ylabel(name)
+        ax.set_title(name)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    for idx, name in enumerate(names_C):
+        ax = axes[1, idx]
+        ax.plot(eps_arr, [kc[name] for kc in KC_smooth], "b-o", label="Гладкий", markersize=4)
+        ax.plot(eps_arr, [kc[name] for kc in KC_textured], "r-s", label="Текстура", markersize=4)
+        ax.set_xlabel("ε")
+        ax.set_ylabel(name)
+        ax.set_title(name)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle("Коэффициенты жёсткости и демпфирования vs ε", fontsize=14)
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/01_KC_vs_epsilon.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_stability_vs_epsilon(eps_arr, stab_smooth, stab_textured, save=True):
+    """K_eq, γ²_st, ω_st vs ε."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    labels = ["K_eq", "γ²_st", "ω_st"]
+
+    for idx, lbl in enumerate(labels):
+        ax = axes[idx]
+        ax.plot(eps_arr, [s[idx] for s in stab_smooth], "b-o", label="Гладкий", markersize=4)
+        ax.plot(eps_arr, [s[idx] for s in stab_textured], "r-s", label="Текстура", markersize=4)
+        ax.set_xlabel("ε")
+        ax.set_ylabel(lbl)
+        ax.set_title(lbl)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle("Параметры устойчивости vs ε", fontsize=14)
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/02_stability_vs_epsilon.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_orbit(sol_smooth, sol_textured, save=True):
+    """Орбита ротора: полная и последние 2 периода."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Полная орбита
+    ax = axes[0]
+    ax.plot(sol_smooth.y[0], sol_smooth.y[1], "b-", alpha=0.5, label="Гладкий")
+    ax.plot(sol_textured.y[0], sol_textured.y[1], "r-", alpha=0.5, label="Текстура")
+    ax.set_xlabel("x/c")
+    ax.set_ylabel("y/c")
+    ax.set_title("Полная орбита")
+    ax.legend()
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+    # Последние 2 периода
+    ax = axes[1]
+    T = 2 * np.pi
+    t_cut = sol_smooth.t[-1] - 2 * T
+    mask_s = sol_smooth.t >= t_cut
+    mask_t = sol_textured.t >= t_cut
+    ax.plot(sol_smooth.y[0][mask_s], sol_smooth.y[1][mask_s], "b-", label="Гладкий")
+    ax.plot(sol_textured.y[0][mask_t], sol_textured.y[1][mask_t], "r-", label="Текстура")
+    ax.set_xlabel("x/c")
+    ax.set_ylabel("y/c")
+    ax.set_title("Последние 2 периода (установившийся режим)")
+    ax.legend()
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/03_orbit.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_Pt(t_nd_s, Pb_s, t_nd_t, Pb_t, save=True):
+    """P(t) — нагрузка на опору."""
+    fig, ax = plt.subplots(figsize=(12, 5))
+    # Показываем последние ~5 периодов
+    T = 2 * np.pi
+    t_cut = max(t_nd_s[-1], t_nd_t[-1]) - 5 * T
+    mask_s = t_nd_s >= t_cut
+    mask_t = t_nd_t >= t_cut
+    ax.plot(t_nd_s[mask_s] / T, Pb_s[mask_s], "b-", label="Гладкий")
+    ax.plot(t_nd_t[mask_t] / T, Pb_t[mask_t], "r-", label="Текстура")
+    ax.set_xlabel("t / T")
+    ax.set_ylabel("P(t), Н")
+    ax.set_title("Нагрузка на опору (последние 5 периодов)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/04_Pt.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_Peq_vs_epsilon(eps_arr, Peq_s, Peq_t, save=True):
+    """P_eq vs ε."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(eps_arr, Peq_s, "b-o", label="Гладкий", markersize=5)
+    ax.plot(eps_arr, Peq_t, "r-s", label="Текстура", markersize=5)
+    ax.set_xlabel("ε")
+    ax.set_ylabel("P_eq, Н")
+    ax.set_title("Эквивалентная нагрузка vs ε")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/05_Peq_vs_epsilon.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_L10h_vs_epsilon(eps_arr, L10h_s, L10h_t, save=True):
+    """L10h vs ε."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.semilogy(eps_arr, L10h_s, "b-o", label="Гладкий", markersize=5)
+    ax.semilogy(eps_arr, L10h_t, "r-s", label="Текстура", markersize=5)
+    ax.set_xlabel("ε")
+    ax.set_ylabel("L₁₀, часов")
+    ax.set_title("Ресурс L₁₀ vs ε")
+    ax.legend()
+    ax.grid(True, alpha=0.3, which="both")
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/06_L10h_vs_epsilon.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_weibull(L10h_smooth, L10h_textured, save=True):
+    """Кривые Вейбулла R(t) при ε₀."""
+    t_max_h = 5 * max(L10h_smooth, L10h_textured)
+    t_hours = np.linspace(0, t_max_h, 1000)
+    _, R_s = weibull_reliability(L10h_smooth, t_hours)
+    _, R_t = weibull_reliability(L10h_textured, t_hours)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(t_hours, R_s, "b-", label="Гладкий")
+    ax.plot(t_hours, R_t, "r-", label="Текстура")
+    ax.axhline(0.9, color="gray", ls="--", alpha=0.5, label="R = 0.9 (L₁₀)")
+    ax.set_xlabel("t, часов")
+    ax.set_ylabel("R(t)")
+    ax.set_title(f"Надёжность по Вейбуллу (ε₀ = {epsilon0_operating})")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/07_weibull.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_ratio_vs_epsilon(eps_arr, ratio_arr, save=True):
+    """Отношение ресурсов L10_textured / L10_smooth vs ε."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(eps_arr, ratio_arr, "g-o", markersize=5)
+    ax.axhline(1.0, color="gray", ls="--", alpha=0.5)
+    ax.set_xlabel("ε")
+    ax.set_ylabel("L₁₀(текст.) / L₁₀(гладк.)")
+    ax.set_title("Отношение ресурсов: текстура / гладкий")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/08_ratio_vs_epsilon.png", dpi=150)
+    plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 70)
+    print("ПАЙПЛАЙН: от решателя Рейнольдса до оценки надёжности")
+    print("=" * 70)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Этап 1: K, C для диапазона ε
+    # ──────────────────────────────────────────────────────────────────
+    print("\n>>> ЭТАП 1: Вычисление коэффициентов K, C")
+
+    # Проверка стабильности δ при рабочем ε
+    print(f"\n--- Проверка стабильности δ при ε = {epsilon0_operating} ---")
+    check_delta_stability(epsilon0_operating, with_depressions=False)
+    check_delta_stability(epsilon0_operating, with_depressions=True)
+
+    # Sweep по ε
+    KC_smooth_nd = []
+    KC_textured_nd = []
+    KC_smooth_dim = []
+    KC_textured_dim = []
+    stab_smooth = []
+    stab_textured = []
+
+    for i, eps in enumerate(epsilon_values):
+        print(f"\n  ε = {eps:.2f} ({i + 1}/{len(epsilon_values)})")
+
+        # Гладкий
+        coef_nd_s, coef_dim_s, diags_s = compute_KC(eps, with_depressions=False)
+        ok_s = sanity_check_KC(coef_nd_s, label=f"smooth ε={eps:.2f}")
+        KC_smooth_nd.append(coef_nd_s)
+        KC_smooth_dim.append(coef_dim_s)
+
+        sp_s = compute_stability_params(**{k: coef_nd_s[k] for k in coef_nd_s})
+        stab_smooth.append(sp_s)
+
+        print(f"    Гладкий: Kxx={coef_nd_s['Kxx']:.3f} Kyy={coef_nd_s['Kyy']:.3f} "
+              f"Cxx={coef_nd_s['Cxx']:.3f} Cyy={coef_nd_s['Cyy']:.3f} "
+              f"{'OK' if ok_s else 'WARN'}")
+
+        # Текстурированный
+        coef_nd_t, coef_dim_t, diags_t = compute_KC(eps, with_depressions=True)
+        ok_t = sanity_check_KC(coef_nd_t, label=f"textured ε={eps:.2f}")
+        KC_textured_nd.append(coef_nd_t)
+        KC_textured_dim.append(coef_dim_t)
+
+        sp_t = compute_stability_params(**{k: coef_nd_t[k] for k in coef_nd_t})
+        stab_textured.append(sp_t)
+
+        print(f"    Текстур: Kxx={coef_nd_t['Kxx']:.3f} Kyy={coef_nd_t['Kyy']:.3f} "
+              f"Cxx={coef_nd_t['Cxx']:.3f} Cyy={coef_nd_t['Cyy']:.3f} "
+              f"{'OK' if ok_t else 'WARN'}")
+
+    # Графики Этапа 1
+    plot_KC_vs_epsilon(epsilon_values, KC_smooth_nd, KC_textured_nd)
+    plot_stability_vs_epsilon(epsilon_values, stab_smooth, stab_textured)
+    print("\nГрафики K/C и устойчивости сохранены.")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Этапы 2-4: для рабочей точки ε₀
+    # ──────────────────────────────────────────────────────────────────
+    idx0 = np.argmin(np.abs(epsilon_values - epsilon0_operating))
+    coef_nd_s0 = KC_smooth_nd[idx0]
+    coef_nd_t0 = KC_textured_nd[idx0]
+    coef_dim_s0 = KC_smooth_dim[idx0]
+    coef_dim_t0 = KC_textured_dim[idx0]
+
+    # Собственные значения (устойчивость)
+    print(f"\n>>> Собственные значения при ε₀ = {epsilon0_operating}")
+    eigs_s = compute_eigenvalues(coef_nd_s0)
+    eigs_t = compute_eigenvalues(coef_nd_t0)
+    print(f"  Гладкий:  {eigs_s}")
+    print(f"  Re(λ) < 0: {np.all(np.real(eigs_s) < 0)}")
+    print(f"  Текстура: {eigs_t}")
+    print(f"  Re(λ) < 0: {np.all(np.real(eigs_t) < 0)}")
+
+    # Этап 2: Орбита
+    print(f"\n>>> ЭТАП 2: Интегрирование орбиты (ε₀ = {epsilon0_operating})")
+    sol_s = integrate_orbit(coef_nd_s0)
+    sol_t = integrate_orbit(coef_nd_t0)
+    print(f"  Гладкий:  t_max = {sol_s.t[-1]:.1f}, точек = {len(sol_s.t)}")
+    print(f"  Текстура: t_max = {sol_t.t[-1]:.1f}, точек = {len(sol_t.t)}")
+    plot_orbit(sol_s, sol_t)
+
+    # Этап 3: P(t) при ε₀
+    print(f"\n>>> ЭТАП 3: Нагрузка на опору (ε₀ = {epsilon0_operating})")
+    Pb_s, _, _ = compute_bearing_load(sol_s, coef_dim_s0)
+    Pb_t, _, _ = compute_bearing_load(sol_t, coef_dim_t0)
+    plot_Pt(sol_s.t, Pb_s, sol_t.t, Pb_t)
+
+    P_max_s = np.max(Pb_s)
+    P_max_t = np.max(Pb_t)
+    P_mean_s = np.mean(Pb_s)
+    P_mean_t = np.mean(Pb_t)
+    Peq_s0 = compute_Peq(Pb_s, sol_s.t)
+    Peq_t0 = compute_Peq(Pb_t, sol_t.t)
+
+    print(f"  Гладкий:  P_max={P_max_s:.1f} Н, P_mean={P_mean_s:.1f} Н, P_eq={Peq_s0:.1f} Н")
+    print(f"  Текстура: P_max={P_max_t:.1f} Н, P_mean={P_mean_t:.1f} Н, P_eq={Peq_t0:.1f} Н")
+
+    # Этап 4: L10, R(t) при ε₀
+    print(f"\n>>> ЭТАП 4: Ресурс и надёжность (ε₀ = {epsilon0_operating})")
+    L10rev_s, L10h_s0 = compute_L10(Peq_s0)
+    L10rev_t, L10h_t0 = compute_L10(Peq_t0)
+    ratio0 = L10h_t0 / L10h_s0 if L10h_s0 > 0 else np.inf
+
+    print(f"  Гладкий:  L10 = {L10rev_s:.0f} об. = {L10h_s0:.1f} ч")
+    print(f"  Текстура: L10 = {L10rev_t:.0f} об. = {L10h_t0:.1f} ч")
+    print(f"  Отношение L10(текст.)/L10(гладк.) = {ratio0:.3f}")
+
+    plot_weibull(L10h_s0, L10h_t0)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Sweep P_eq, L10h по ε (этапы 3-4 для всех ε)
+    # ──────────────────────────────────────────────────────────────────
+    print("\n>>> Sweep P_eq, L10h по ε (с интегрированием орбиты для каждого ε)")
+
+    Peq_smooth_arr = []
+    Peq_textured_arr = []
+    L10h_smooth_arr = []
+    L10h_textured_arr = []
+    ratio_arr = []
+
+    for i, eps in enumerate(epsilon_values):
+        print(f"  ε = {eps:.2f} ({i + 1}/{len(epsilon_values)})")
+
+        coef_nd_s_i = KC_smooth_nd[i]
+        coef_nd_t_i = KC_textured_nd[i]
+        coef_dim_s_i = KC_smooth_dim[i]
+        coef_dim_t_i = KC_textured_dim[i]
+
+        # Орбита
+        sol_si = integrate_orbit(coef_nd_s_i)
+        sol_ti = integrate_orbit(coef_nd_t_i)
+
+        # P(t)
+        Pb_si, _, _ = compute_bearing_load(sol_si, coef_dim_s_i)
+        Pb_ti, _, _ = compute_bearing_load(sol_ti, coef_dim_t_i)
+
+        # P_eq
+        Peq_si = compute_Peq(Pb_si, sol_si.t)
+        Peq_ti = compute_Peq(Pb_ti, sol_ti.t)
+        Peq_smooth_arr.append(Peq_si)
+        Peq_textured_arr.append(Peq_ti)
+
+        # L10h
+        _, L10h_si = compute_L10(Peq_si)
+        _, L10h_ti = compute_L10(Peq_ti)
+        L10h_smooth_arr.append(L10h_si)
+        L10h_textured_arr.append(L10h_ti)
+
+        r = L10h_ti / L10h_si if L10h_si > 0 else np.inf
+        ratio_arr.append(r)
+
+        print(f"    P_eq: гл.={Peq_si:.1f} Н, текст.={Peq_ti:.1f} Н | "
+              f"L10h: гл.={L10h_si:.1f}, текст.={L10h_ti:.1f}, ratio={r:.3f}")
+
+    # Графики
+    plot_Peq_vs_epsilon(epsilon_values, Peq_smooth_arr, Peq_textured_arr)
+    plot_L10h_vs_epsilon(epsilon_values, L10h_smooth_arr, L10h_textured_arr)
+    plot_ratio_vs_epsilon(epsilon_values, ratio_arr)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Итоговая таблица
+    # ──────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 90)
+    print("ИТОГОВАЯ ТАБЛИЦА")
+    print("=" * 90)
+    print(f"{'ε':>6} | {'P_eq_smooth':>12} | {'P_eq_text':>12} | "
+          f"{'L10h_smooth':>12} | {'L10h_text':>12} | {'ratio':>8}")
+    print("-" * 90)
+    for i, eps in enumerate(epsilon_values):
+        print(f"{eps:>6.2f} | {Peq_smooth_arr[i]:>12.1f} | {Peq_textured_arr[i]:>12.1f} | "
+              f"{L10h_smooth_arr[i]:>12.1f} | {L10h_textured_arr[i]:>12.1f} | "
+              f"{ratio_arr[i]:>8.3f}")
+    print("=" * 90)
+
+    # Общий вывод
+    print("\n>>> ВЫВОДЫ:")
+    if all(r > 1 for r in ratio_arr):
+        print("  Текстура УВЕЛИЧИВАЕТ ресурс во всём диапазоне ε.")
+    elif all(r < 1 for r in ratio_arr):
+        print("  Текстура УМЕНЬШАЕТ ресурс во всём диапазоне ε.")
+    else:
+        print("  Эффект текстуры НЕОДНОЗНАЧЕН: зависит от ε.")
+        for i, eps in enumerate(epsilon_values):
+            if ratio_arr[i] < 1:
+                print(f"    ε={eps:.2f}: текстура УХУДШАЕТ (ratio={ratio_arr[i]:.3f})")
+
+    print(f"\nВсе графики сохранены в {PLOT_DIR}/")
+    print("Пайплайн завершён.")
+
+
+if __name__ == "__main__":
+    main()
