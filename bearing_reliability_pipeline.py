@@ -8,18 +8,23 @@
 Этап 4: Ресурс и надёжность по Лундбергу–Палмгрену
 
 Сравнение: гладкий подшипник vs эллипсоидальная текстура.
+
+Зависимости:
+    pip install -e <путь_к_GPU_reynolds>   # https://github.com/Daos711/GPU_reynolds
+    pip install numpy scipy matplotlib
 """
 
 import os
 import warnings
 import numpy as np
 from scipy.integrate import solve_ivp
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
+
+# Совместимость numpy 1.x / 2.x
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 
 # ──────────────────────────────────────────────────────────────────────
 # Конфигурация (все физические параметры)
@@ -59,9 +64,8 @@ K_scale = eta * omega_shaft * L / psi ** 3    # Н/м
 C_scale = eta * L / psi ** 3                  # Н·с/м
 
 # --- Сетка ---
-# 200x200 for reasonable runtime; increase to 500x500 for publication quality
-num_phi_points = 200
-num_Z_points = 200
+num_phi_points = 500
+num_Z_points = 500
 
 phi_1D = np.linspace(0, 2 * np.pi, num_phi_points, endpoint=False)
 Z = np.linspace(-1, 1, num_Z_points)
@@ -157,8 +161,8 @@ def solver_adapter(ex, ey, exdot_star=0.0, eydot_star=0.0,
     )
 
     # Интегрирование давления -> силы (безразмерные)
-    Fx_nd = np.trapezoid(np.trapezoid(P * cos_phi_mesh, phi_1D, axis=1), Z)
-    Fy_nd = np.trapezoid(np.trapezoid(P * sin_phi_mesh, phi_1D, axis=1), Z)
+    Fx_nd = _trapezoid(_trapezoid(P * cos_phi_mesh, phi_1D, axis=1), Z)
+    Fy_nd = _trapezoid(_trapezoid(P * sin_phi_mesh, phi_1D, axis=1), Z)
 
     # Размерные силы
     Fx_dim = Fx_nd * load_scale
