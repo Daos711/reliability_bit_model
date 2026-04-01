@@ -98,7 +98,8 @@ Omega = omega_shaft    # возмущающая частота
 
 # --- Параметры возмущений ---
 de = 5e-4             # для жёсткости
-dv = 5e-4             # для демпфирования
+dv_diag = 5e-4        # для Cxx, Cyy (диагональные — стабильны)
+dv_cross = 1e-2       # для Cxy, Cyx (перекрёстные — нужен больший шаг)
 
 # --- Диапазон эксцентриситетов ---
 epsilon_values = np.linspace(0.2, 0.8, 10)
@@ -181,7 +182,8 @@ def solver_adapter(ex, ey, exdot_star=0.0, eydot_star=0.0,
 # Compute K, C (8 коэффициентов)
 # ──────────────────────────────────────────────────────────────────────
 
-def compute_KC(epsilon, with_depressions=False, de_val=None, dv_val=None):
+def compute_KC(epsilon, with_depressions=False, de_val=None,
+               dv_diag_val=None, dv_cross_val=None):
     """
     Вычислить 8 коэффициентов жёсткости и демпфирования.
 
@@ -189,29 +191,15 @@ def compute_KC(epsilon, with_depressions=False, de_val=None, dv_val=None):
         K_ij = -dF_i / dq_j
         C_ij = -dF_i / dq̇_j
 
-    Parameters
-    ----------
-    epsilon : float
-        Статический эксцентриситет (ex0 = epsilon, ey0 = 0).
-    with_depressions : bool
-        С текстурой или без.
-    de_val, dv_val : float or None
-        Размер возмущения. По умолчанию из глобального конфига.
-
-    Returns
-    -------
-    coef : dict
-        Словарь с ключами Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy
-        (безразмерные — делённые на K_scale / C_scale).
-    coef_dim : dict
-        То же, но размерные (Н/м для K, Н·с/м для C).
-    diags : list of dict
-        Диагностика каждого решения.
+    Используются раздельные шаги dv для диагональных (Cxx, Cyy)
+    и перекрёстных (Cxy, Cyx) коэффициентов демпфирования.
     """
     if de_val is None:
         de_val = de
-    if dv_val is None:
-        dv_val = dv
+    if dv_diag_val is None:
+        dv_diag_val = dv_diag
+    if dv_cross_val is None:
+        dv_cross_val = dv_cross
 
     ex0 = epsilon
     ey0 = 0.0
@@ -223,8 +211,6 @@ def compute_KC(epsilon, with_depressions=False, de_val=None, dv_val=None):
     Fx_m, Fy_m, d2 = solver_adapter(ex0 - de_val, ey0, with_depressions=with_depressions)
     diags.extend([d1, d2])
 
-    # K_ij = -dF_i / dq_j ;  dq_j = de * c (размерное), здесь в безразмерных координатах
-    # Безразмерные силы уже умножены на load_scale, деление на 2*de дает dF/d(epsilon)
     Kxx_star = -(Fx_p - Fx_m) / (2 * de_val)
     Kyx_star = -(Fy_p - Fy_m) / (2 * de_val)
 
@@ -236,23 +222,35 @@ def compute_KC(epsilon, with_depressions=False, de_val=None, dv_val=None):
     Kxy_star = -(Fx_p - Fx_m) / (2 * de_val)
     Kyy_star = -(Fy_p - Fy_m) / (2 * de_val)
 
-    # ─── Демпфирование: возмущение ėx ± dv ───
-    # ėx -> yprime в решателе (ПЕРЕСТАНОВКА в solver_adapter)
-    Fx_p, Fy_p, d5 = solver_adapter(ex0, ey0, exdot_star=+dv_val, with_depressions=with_depressions)
-    Fx_m, Fy_m, d6 = solver_adapter(ex0, ey0, exdot_star=-dv_val, with_depressions=with_depressions)
+    # ─── Демпфирование ėx: Cxx (диаг, dv_diag), Cyx (перекр, dv_cross) ───
+    # Cxx: прямой отклик Fx на ėx
+    Fx_p, Fy_p, d5 = solver_adapter(ex0, ey0, exdot_star=+dv_diag_val, with_depressions=with_depressions)
+    Fx_m, Fy_m, d6 = solver_adapter(ex0, ey0, exdot_star=-dv_diag_val, with_depressions=with_depressions)
     diags.extend([d5, d6])
+    Cxx_star = -(Fx_p - Fx_m) / (2 * dv_diag_val)
 
-    Cxx_star = -(Fx_p - Fx_m) / (2 * dv_val)
-    Cyx_star = -(Fy_p - Fy_m) / (2 * dv_val)
+    # Cyx: перекрёстный отклик Fy на ėx
+    Fx_p2, Fy_p2, d5c = solver_adapter(ex0, ey0, exdot_star=+dv_cross_val, with_depressions=with_depressions)
+    Fx_m2, Fy_m2, d6c = solver_adapter(ex0, ey0, exdot_star=-dv_cross_val, with_depressions=with_depressions)
+    diags.extend([d5c, d6c])
+    Cyx_star = -(Fy_p2 - Fy_m2) / (2 * dv_cross_val)
+    print(f"    Cyx debug: Fy(+dv)={Fy_p2:.6e}, Fy(-dv)={Fy_m2:.6e}, "
+          f"diff={Fy_p2 - Fy_m2:.6e}, delta+={d5c['delta']:.2e}, delta-={d6c['delta']:.2e}")
 
-    # ─── Демпфирование: возмущение ėy ± dv ───
-    # ėy -> xprime в решателе (ПЕРЕСТАНОВКА в solver_adapter)
-    Fx_p, Fy_p, d7 = solver_adapter(ex0, ey0, eydot_star=+dv_val, with_depressions=with_depressions)
-    Fx_m, Fy_m, d8 = solver_adapter(ex0, ey0, eydot_star=-dv_val, with_depressions=with_depressions)
+    # ─── Демпфирование ėy: Cyy (диаг, dv_diag), Cxy (перекр, dv_cross) ───
+    # Cyy: прямой отклик Fy на ėy
+    Fx_p, Fy_p, d7 = solver_adapter(ex0, ey0, eydot_star=+dv_diag_val, with_depressions=with_depressions)
+    Fx_m, Fy_m, d8 = solver_adapter(ex0, ey0, eydot_star=-dv_diag_val, with_depressions=with_depressions)
     diags.extend([d7, d8])
+    Cyy_star = -(Fy_p - Fy_m) / (2 * dv_diag_val)
 
-    Cxy_star = -(Fx_p - Fx_m) / (2 * dv_val)
-    Cyy_star = -(Fy_p - Fy_m) / (2 * dv_val)
+    # Cxy: перекрёстный отклик Fx на ėy
+    Fx_p2, Fy_p2, d7c = solver_adapter(ex0, ey0, eydot_star=+dv_cross_val, with_depressions=with_depressions)
+    Fx_m2, Fy_m2, d8c = solver_adapter(ex0, ey0, eydot_star=-dv_cross_val, with_depressions=with_depressions)
+    diags.extend([d7c, d8c])
+    Cxy_star = -(Fx_p2 - Fx_m2) / (2 * dv_cross_val)
+    print(f"    Cxy debug: Fx(+dv)={Fx_p2:.6e}, Fx(-dv)={Fx_m2:.6e}, "
+          f"diff={Fx_p2 - Fx_m2:.6e}, delta+={d7c['delta']:.2e}, delta-={d8c['delta']:.2e}")
 
     # ─── Перевод в размерные ───
     # K: сила / de -> сила / (de * c) = K_dim [Н/м]
@@ -324,8 +322,10 @@ def sanity_check_KC(coef_nd, label=""):
 
 def check_delta_stability(epsilon, with_depressions=False):
     """Проверить, что коэффициенты устойчивы к изменению δ в 2 раза."""
-    coef1, _, _ = compute_KC(epsilon, with_depressions=with_depressions, de_val=de, dv_val=dv)
-    coef2, _, _ = compute_KC(epsilon, with_depressions=with_depressions, de_val=de / 2, dv_val=dv / 2)
+    coef1, _, _ = compute_KC(epsilon, with_depressions=with_depressions,
+                             de_val=de, dv_diag_val=dv_diag, dv_cross_val=dv_cross)
+    coef2, _, _ = compute_KC(epsilon, with_depressions=with_depressions,
+                             de_val=de / 2, dv_diag_val=dv_diag / 2, dv_cross_val=dv_cross / 2)
 
     print(f"\n{'='*60}")
     print(f"Проверка стабильности δ (ε={epsilon}, text={'да' if with_depressions else 'нет'})")
@@ -384,7 +384,7 @@ def integrate_orbit(coef_nd, n_periods=40, pts_per_period=200):
     def rotor_ode(t_star, state):
         x, y, vx, vy = state
         Fx_ext = F_nd * np.cos(t_star)
-        Fy_ext = F_nd * np.sin(t_star)
+        Fy_ext = 0.0
         ax = (Fx_ext
               - coef_nd["Kxx"] * x - coef_nd["Kxy"] * y
               - coef_nd["Cxx"] * vx - coef_nd["Cxy"] * vy) / m_nd
@@ -760,14 +760,23 @@ def main():
     plot_Pt(sol_s.t, Pb_s, sol_t.t, Pb_t)
 
     P_max_s = np.max(Pb_s)
-    P_max_t = np.max(Pb_t)
+    P_min_s = np.min(Pb_s)
     P_mean_s = np.mean(Pb_s)
+    P_max_t = np.max(Pb_t)
+    P_min_t = np.min(Pb_t)
     P_mean_t = np.mean(Pb_t)
     Peq_s0 = compute_Peq(Pb_s, sol_s.t)
     Peq_t0 = compute_Peq(Pb_t, sol_t.t)
 
-    print(f"  Гладкий:  P_max={P_max_s:.1f} Н, P_mean={P_mean_s:.1f} Н, P_eq={Peq_s0:.1f} Н")
-    print(f"  Текстура: P_max={P_max_t:.1f} Н, P_mean={P_mean_t:.1f} Н, P_eq={Peq_t0:.1f} Н")
+    P_var_s = (P_max_s - P_min_s) / P_mean_s if P_mean_s > 0 else 0
+    P_var_t = (P_max_t - P_min_t) / P_mean_t if P_mean_t > 0 else 0
+
+    print(f"  Гладкий:  P_min={P_min_s:.1f}, P_max={P_max_s:.1f}, P_mean={P_mean_s:.1f}, "
+          f"P_eq={Peq_s0:.1f} Н, P_var={P_var_s:.4f}")
+    print(f"  Текстура: P_min={P_min_t:.1f}, P_max={P_max_t:.1f}, P_mean={P_mean_t:.1f}, "
+          f"P_eq={Peq_t0:.1f} Н, P_var={P_var_t:.4f}")
+    if P_var_s < 0.01 and P_var_t < 0.01:
+        warnings.warn("P_var < 0.01 — P(t) почти константа, LP-блок может не различить случаи!")
 
     # Этап 4: L10, R(t) при ε₀
     print(f"\n>>> ЭТАП 4: Ресурс и надёжность (ε₀ = {epsilon0_operating})")
@@ -847,16 +856,24 @@ def main():
     print("=" * 90)
 
     # Общий вывод
+    significance_tol = 0.01  # 1% порог значимости
     print("\n>>> ВЫВОДЫ:")
-    if all(r > 1 for r in ratio_arr):
+    improves = [r > 1 + significance_tol for r in ratio_arr]
+    worsens = [r < 1 - significance_tol for r in ratio_arr]
+    if all(improves):
         print("  Текстура УВЕЛИЧИВАЕТ ресурс во всём диапазоне ε.")
-    elif all(r < 1 for r in ratio_arr):
+    elif all(worsens):
         print("  Текстура УМЕНЬШАЕТ ресурс во всём диапазоне ε.")
     else:
-        print("  Эффект текстуры НЕОДНОЗНАЧЕН: зависит от ε.")
+        print("  Эффект текстуры зависит от ε:")
         for i, eps in enumerate(epsilon_values):
-            if ratio_arr[i] < 1:
-                print(f"    ε={eps:.2f}: текстура УХУДШАЕТ (ratio={ratio_arr[i]:.3f})")
+            r = ratio_arr[i]
+            if r < 1 - significance_tol:
+                print(f"    ε={eps:.2f}: текстура УХУДШАЕТ (ratio={r:.3f})")
+            elif r > 1 + significance_tol:
+                print(f"    ε={eps:.2f}: текстура УЛУЧШАЕТ (ratio={r:.3f})")
+            else:
+                print(f"    ε={eps:.2f}: эффект незначим (ratio={r:.3f})")
 
     print(f"\nВсе графики сохранены в {PLOT_DIR}/")
     print("Пайплайн завершён.")
