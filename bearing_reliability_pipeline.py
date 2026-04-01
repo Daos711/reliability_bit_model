@@ -760,6 +760,21 @@ def main():
     coef_nd_s0 = KC_smooth_nd[idx0]
     coef_nd_t0 = KC_textured_nd[idx0]
 
+    # ─── Верификация масштабов ───
+    print(f"\n>>> ДИАГНОСТИКА МАСШТАБОВ (ε₀ = {epsilon0_operating})")
+    print(f"  K_scale = {K_scale:.3e} Н/м")
+    print(f"  C_scale = {C_scale:.3e} Н·с/м")
+    Cxx_dim_check = coef_nd_s0["Cxx"] * C_scale
+    print(f"  Cxx_nd(гладк.) = {coef_nd_s0['Cxx']:.4f}")
+    print(f"  Cxx_dim = Cxx_nd × C_scale = {Cxx_dim_check:.3e} Н·с/м")
+    print(f"  K_pk = {K_pk_xx:.3e} Н/м,  C_pk = {C_pk_xx:.3e} Н·с/м")
+    Kpk_nd = K_pk_xx / K_scale
+    Cpk_nd = C_pk_xx / C_scale
+    print(f"  Kpk_nd = {Kpk_nd:.3e},  Kps_nd = {coef_nd_s0['Kxx']:.3e}")
+    print(f"  Cpk_nd = {Cpk_nd:.3e},  Cps_nd = {coef_nd_s0['Cxx']:.3e}")
+    print(f"  Kpk/Kps = {Kpk_nd / coef_nd_s0['Kxx']:.3e}")
+    print(f"  Cpk/Cps = {Cpk_nd / coef_nd_s0['Cxx']:.3e}")
+
     # Собственные значения (устойчивость)
     print(f"\n>>> Собственные значения при ε₀ = {epsilon0_operating}")
     eigs_s = compute_eigenvalues(coef_nd_s0)
@@ -779,6 +794,20 @@ def main():
 
     # Этап 3: Нагрузка на подшипник КАЧЕНИЯ (ПК)
     print(f"\n>>> ЭТАП 3: Нагрузка на ПК (ε₀ = {epsilon0_operating})")
+
+    # Диагностика амплитуд орбиты
+    for label, sol in [("Гладкий", sol_s), ("Текстура", sol_t)]:
+        x_dim = sol.y[0] * c
+        y_dim = sol.y[1] * c
+        xdot_dim = sol.y[2] * c * Omega
+        ydot_dim = sol.y[3] * c * Omega
+        Fx_K = K_pk_xx * x_dim
+        Fx_C = C_pk_xx * xdot_dim
+        print(f"  {label}: max|x|={np.max(np.abs(x_dim)):.2e} м, "
+              f"max|y|={np.max(np.abs(y_dim)):.2e} м, "
+              f"max|Fpk_K|={np.max(np.abs(Fx_K)):.2e} Н, "
+              f"max|Fpk_C|={np.max(np.abs(Fx_C)):.2e} Н")
+
     Pb_s, _, _ = compute_bearing_load_pk(sol_s)
     Pb_t, _, _ = compute_bearing_load_pk(sol_t)
     plot_Pt(sol_s.t, Pb_s, sol_t.t, Pb_t)
@@ -861,6 +890,62 @@ def main():
     plot_Peq_vs_epsilon(epsilon_values, Peq_smooth_arr, Peq_textured_arr)
     plot_L10h_vs_epsilon(epsilon_values, L10h_smooth_arr, L10h_textured_arr)
     plot_ratio_vs_epsilon(epsilon_values, ratio_arr)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Параметрический sweep по K_pk (sensitivity study)
+    # ──────────────────────────────────────────────────────────────────
+    print("\n>>> SENSITIVITY STUDY: влияние K_pk на результат (ε₀ = {:.2f})".format(
+        epsilon0_operating))
+    K_pk_variants = [1e8, 1e9, 1e10, 1e11]
+    print(f"{'K_pk':>12} | {'Peq_smooth':>12} | {'Peq_text':>12} | "
+          f"{'L10h_smooth':>14} | {'L10h_text':>14} | {'ratio':>8}")
+    print("-" * 90)
+
+    _sens_rows = []
+    for K_pk_test in K_pk_variants:
+        row = {"K_pk": K_pk_test}
+        for case, coef_nd_ps in [("smooth", coef_nd_s0), ("textured", coef_nd_t0)]:
+            m_nd = m_rotor * Omega ** 2 / K_scale
+            F_nd = F0 / (K_scale * c)
+            Kxx_t = coef_nd_ps["Kxx"] + K_pk_test / K_scale
+            Kxy_t = coef_nd_ps["Kxy"]
+            Kyx_t = coef_nd_ps["Kyx"]
+            Kyy_t = coef_nd_ps["Kyy"] + K_pk_test / K_scale
+            Cxx_t = coef_nd_ps["Cxx"] + C_pk_xx / C_scale
+            Cxy_t = coef_nd_ps["Cxy"]
+            Cyx_t = coef_nd_ps["Cyx"]
+            Cyy_t = coef_nd_ps["Cyy"] + C_pk_yy / C_scale
+
+            def _ode(t_star, state, Kxx=Kxx_t, Kxy=Kxy_t, Kyx=Kyx_t, Kyy=Kyy_t,
+                     Cxx=Cxx_t, Cxy=Cxy_t, Cyx=Cyx_t, Cyy=Cyy_t,
+                     m=m_nd, F=F_nd):
+                x, y, vx, vy = state
+                ax = (F * np.cos(t_star) - Kxx*x - Kxy*y - Cxx*vx - Cxy*vy) / m
+                ay = (- Kyx*x - Kyy*y - Cyx*vx - Cyy*vy) / m
+                return [vx, vy, ax, ay]
+
+            t_max_s = 40 * 2 * np.pi
+            t_eval_s = np.linspace(0, t_max_s, 8000)
+            sol_tmp = solve_ivp(_ode, (0, t_max_s), [0, 0, 0, 0],
+                                method="BDF", rtol=1e-8, atol=1e-10, t_eval=t_eval_s)
+            x_d = sol_tmp.y[0] * c
+            y_d = sol_tmp.y[1] * c
+            xdot_d = sol_tmp.y[2] * c * Omega
+            ydot_d = sol_tmp.y[3] * c * Omega
+            Fx = K_pk_test * x_d + C_pk_xx * xdot_d
+            Fy = K_pk_test * y_d + C_pk_yy * ydot_d
+            P_tmp = np.sqrt(Fx**2 + Fy**2)
+            Peq = compute_Peq(P_tmp, sol_tmp.t)
+            _, L10h = compute_L10(Peq)
+            row[f"Peq_{case}"] = Peq
+            row[f"L10h_{case}"] = L10h
+        row["ratio"] = row["L10h_textured"] / row["L10h_smooth"] if row["L10h_smooth"] > 0 else np.inf
+        _sens_rows.append(row)
+        print(f"{K_pk_test:>12.0e} | {row['Peq_smooth']:>12.2f} | {row['Peq_textured']:>12.2f} | "
+              f"{row['L10h_smooth']:>14.2e} | {row['L10h_textured']:>14.2e} | "
+              f"{row['ratio']:>8.3f}")
+
+    print("\nЕсли ratio устойчив к вариации K_pk — относительный эффект текстуры надёжен.")
 
     # ──────────────────────────────────────────────────────────────────
     # Итоговая таблица
