@@ -535,7 +535,7 @@ _PLOT_STYLE = {
 def _style_ax(ax, title="", xlabel="", ylabel=""):
     """Применить стиль к осям."""
     s = _PLOT_STYLE
-    ax.set_title(title, fontsize=s["fontsize_title"], fontweight="bold")
+    # title не ставим — в отчёте подпись под рисунком
     ax.set_xlabel(xlabel, fontsize=s["fontsize_label"])
     ax.set_ylabel(ylabel, fontsize=s["fontsize_label"])
     ax.tick_params(labelsize=s["fontsize_tick"])
@@ -808,9 +808,7 @@ def load_and_plot(filepath):
     fig, ax = plt.subplots(figsize=s["figsize_single"])
     ax.semilogx(sens_K_pk, sens_ratio, "ko-",
                 markersize=s["markersize"], lw=s["linewidth"])
-    _style_ax(ax,
-              title=f"Sensitivity study: ratio vs K_pk (ε₀ = {epsilon0_operating})",
-              xlabel="K_pk, Н/м",
+    _style_ax(ax, xlabel="K_pk, Н/м",
               ylabel="L₁₀(текст.) / L₁₀(гладк.)")
     ax.set_ylim(0, max(sens_ratio) * 1.5)
     fig.tight_layout()
@@ -1098,7 +1096,7 @@ def main():
     ax.semilogx(kpk_vals, ratio_vals, "ko-", markersize=8)
     ax.set_xlabel("K_pk, Н/м")
     ax.set_ylabel("L10(текст.) / L10(гладк.)")
-    ax.set_title(f"Sensitivity study: ratio vs K_pk (ε₀ = {epsilon0_operating})")
+    # без заголовка — подпись в отчёте
     ax.grid(True, alpha=0.3)
     ax.set_ylim(0, max(ratio_vals) * 1.5)
     fig.tight_layout()
