@@ -15,6 +15,7 @@
 """
 
 import os
+import sys
 import warnings
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -116,9 +117,10 @@ dv_cxy = 1e-1         # для Cxy (требует большего шага)
 epsilon_values = np.linspace(0.2, 0.8, 10)
 epsilon0_operating = 0.6   # рабочая точка
 
-# --- Директория для графиков ---
+# --- Директория для графиков и файл данных ---
 PLOT_DIR = "plots"
 os.makedirs(PLOT_DIR, exist_ok=True)
+DATA_FILE = "results.npz"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -515,188 +517,307 @@ def weibull_reliability(L10h, t_hours=None):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Построение графиков
+# Стиль графиков (для отчёта/статьи)
 # ──────────────────────────────────────────────────────────────────────
 
+_PLOT_STYLE = {
+    "linewidth": 2.0,
+    "markersize": 6,
+    "fontsize_title": 14,
+    "fontsize_label": 12,
+    "fontsize_legend": 11,
+    "fontsize_tick": 10,
+    "dpi": 200,
+    "figsize_single": (8, 6),
+}
+
+
+def _style_ax(ax, title="", xlabel="", ylabel=""):
+    """Применить стиль к осям."""
+    s = _PLOT_STYLE
+    ax.set_title(title, fontsize=s["fontsize_title"], fontweight="bold")
+    ax.set_xlabel(xlabel, fontsize=s["fontsize_label"])
+    ax.set_ylabel(ylabel, fontsize=s["fontsize_label"])
+    ax.tick_params(labelsize=s["fontsize_tick"])
+    ax.legend(fontsize=s["fontsize_legend"])
+    ax.grid(True, alpha=0.3)
+
+
 def plot_KC_vs_epsilon(eps_arr, KC_smooth, KC_textured, save=True):
-    """8 графиков K_ij(ε) и C_ij(ε) — гладкий vs текстура."""
-    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
-    names_K = ["Kxx", "Kxy", "Kyx", "Kyy"]
-    names_C = ["Cxx", "Cxy", "Cyx", "Cyy"]
+    """8 отдельных графиков K_ij(ε) и C_ij(ε)."""
+    s = _PLOT_STYLE
+    all_names = ["Kxx", "Kxy", "Kyx", "Kyy", "Cxx", "Cxy", "Cyx", "Cyy"]
 
-    for idx, name in enumerate(names_K):
-        ax = axes[0, idx]
-        ax.plot(eps_arr, [kc[name] for kc in KC_smooth], "b-o", label="Гладкий", markersize=4)
-        ax.plot(eps_arr, [kc[name] for kc in KC_textured], "r-s", label="Текстура", markersize=4)
-        ax.set_xlabel("ε")
-        ax.set_ylabel(name)
-        ax.set_title(name)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    for idx, name in enumerate(names_C):
-        ax = axes[1, idx]
-        ax.plot(eps_arr, [kc[name] for kc in KC_smooth], "b-o", label="Гладкий", markersize=4)
-        ax.plot(eps_arr, [kc[name] for kc in KC_textured], "r-s", label="Текстура", markersize=4)
-        ax.set_xlabel("ε")
-        ax.set_ylabel(name)
-        ax.set_title(name)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    fig.suptitle("Коэффициенты жёсткости и демпфирования vs ε", fontsize=14)
-    fig.tight_layout()
-    if save:
-        fig.savefig(f"{PLOT_DIR}/01_KC_vs_epsilon.png", dpi=150)
-    plt.close(fig)
+    for name in all_names:
+        fig, ax = plt.subplots(figsize=s["figsize_single"])
+        ax.plot(eps_arr, [kc[name] for kc in KC_smooth], "b-o",
+                label="Гладкий", lw=s["linewidth"], ms=s["markersize"])
+        ax.plot(eps_arr, [kc[name] for kc in KC_textured], "r-s",
+                label="Текстура", lw=s["linewidth"], ms=s["markersize"])
+        _style_ax(ax, title=f"{name} vs ε", xlabel="ε", ylabel=name)
+        fig.tight_layout()
+        if save:
+            fig.savefig(f"{PLOT_DIR}/01_{name}_vs_epsilon.png", dpi=s["dpi"])
+        plt.close(fig)
 
 
 def plot_stability_vs_epsilon(eps_arr, stab_smooth, stab_textured, save=True):
-    """K_eq, γ²_st, ω_st vs ε."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    labels = ["K_eq", "γ²_st", "ω_st"]
+    """3 отдельных графика: K_eq, γ²_st, ω_st."""
+    s = _PLOT_STYLE
+    labels = ["K_eq", "gamma2_st", "omega_st"]
+    titles = ["K_eq vs ε", "γ²_st vs ε", "ω_st vs ε"]
+    ylabels = ["K_eq", "γ²_st", "ω_st"]
 
-    for idx, lbl in enumerate(labels):
-        ax = axes[idx]
-        ax.plot(eps_arr, [s[idx] for s in stab_smooth], "b-o", label="Гладкий", markersize=4)
-        ax.plot(eps_arr, [s[idx] for s in stab_textured], "r-s", label="Текстура", markersize=4)
-        ax.set_xlabel("ε")
-        ax.set_ylabel(lbl)
-        ax.set_title(lbl)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    fig.suptitle("Параметры устойчивости vs ε", fontsize=14)
-    fig.tight_layout()
-    if save:
-        fig.savefig(f"{PLOT_DIR}/02_stability_vs_epsilon.png", dpi=150)
-    plt.close(fig)
+    for idx, (lbl, title, ylabel) in enumerate(zip(labels, titles, ylabels)):
+        fig, ax = plt.subplots(figsize=s["figsize_single"])
+        ax.plot(eps_arr, [st[idx] for st in stab_smooth], "b-o",
+                label="Гладкий", lw=s["linewidth"], ms=s["markersize"])
+        ax.plot(eps_arr, [st[idx] for st in stab_textured], "r-s",
+                label="Текстура", lw=s["linewidth"], ms=s["markersize"])
+        _style_ax(ax, title=title, xlabel="ε", ylabel=ylabel)
+        fig.tight_layout()
+        if save:
+            fig.savefig(f"{PLOT_DIR}/02_{lbl}_vs_epsilon.png", dpi=s["dpi"])
+        plt.close(fig)
 
 
 def plot_orbit(sol_smooth, sol_textured, save=True):
-    """Орбита ротора: полная и последние 2 периода."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    # Полная орбита
-    ax = axes[0]
-    ax.plot(sol_smooth.y[0], sol_smooth.y[1], "b-", alpha=0.5, label="Гладкий")
-    ax.plot(sol_textured.y[0], sol_textured.y[1], "r-", alpha=0.5, label="Текстура")
-    ax.set_xlabel("x/c")
-    ax.set_ylabel("y/c")
-    ax.set_title("Полная орбита")
-    ax.legend()
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-
-    # Последние 2 периода
-    ax = axes[1]
+    """x(t) и y(t) — временные ряды (вместо орбиты x-y, где ничего не видно)."""
+    s = _PLOT_STYLE
     T = 2 * np.pi
-    t_cut = sol_smooth.t[-1] - 2 * T
+    t_cut = sol_smooth.t[-1] - 5 * T
+
+    # x(t) — последние 5 периодов
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
     mask_s = sol_smooth.t >= t_cut
     mask_t = sol_textured.t >= t_cut
-    ax.plot(sol_smooth.y[0][mask_s], sol_smooth.y[1][mask_s], "b-", label="Гладкий")
-    ax.plot(sol_textured.y[0][mask_t], sol_textured.y[1][mask_t], "r-", label="Текстура")
-    ax.set_xlabel("x/c")
-    ax.set_ylabel("y/c")
-    ax.set_title("Последние 2 периода (установившийся режим)")
-    ax.legend()
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-
+    ax.plot(sol_smooth.t[mask_s] / T, sol_smooth.y[0][mask_s],
+            "b-", label="Гладкий", lw=s["linewidth"])
+    ax.plot(sol_textured.t[mask_t] / T, sol_textured.y[0][mask_t],
+            "r-", label="Текстура", lw=s["linewidth"])
+    _style_ax(ax, title="Колебания ротора x(t) (последние 5 периодов)",
+              xlabel="t / T", ylabel="x / c")
     fig.tight_layout()
     if save:
-        fig.savefig(f"{PLOT_DIR}/03_orbit.png", dpi=150)
+        fig.savefig(f"{PLOT_DIR}/03a_xt.png", dpi=s["dpi"])
+    plt.close(fig)
+
+    # y(t) — последние 5 периодов
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.plot(sol_smooth.t[mask_s] / T, sol_smooth.y[1][mask_s],
+            "b-", label="Гладкий", lw=s["linewidth"])
+    ax.plot(sol_textured.t[mask_t] / T, sol_textured.y[1][mask_t],
+            "r-", label="Текстура", lw=s["linewidth"])
+    _style_ax(ax, title="Колебания ротора y(t) (последние 5 периодов)",
+              xlabel="t / T", ylabel="y / c")
+    fig.tight_layout()
+    if save:
+        fig.savefig(f"{PLOT_DIR}/03b_yt.png", dpi=s["dpi"])
     plt.close(fig)
 
 
 def plot_Pt(t_nd_s, Pb_s, t_nd_t, Pb_t, save=True):
-    """P(t) — нагрузка на опору."""
-    fig, ax = plt.subplots(figsize=(12, 5))
-    # Показываем последние ~5 периодов
+    """P(t) — нагрузка на ПК."""
+    s = _PLOT_STYLE
     T = 2 * np.pi
     t_cut = max(t_nd_s[-1], t_nd_t[-1]) - 5 * T
     mask_s = t_nd_s >= t_cut
     mask_t = t_nd_t >= t_cut
-    ax.plot(t_nd_s[mask_s] / T, Pb_s[mask_s], "b-", label="Гладкий")
-    ax.plot(t_nd_t[mask_t] / T, Pb_t[mask_t], "r-", label="Текстура")
-    ax.set_xlabel("t / T")
-    ax.set_ylabel("P(t), Н")
-    ax.set_title("Нагрузка на опору (последние 5 периодов)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.plot(t_nd_s[mask_s] / T, Pb_s[mask_s], "b-",
+            label="Гладкий", lw=s["linewidth"])
+    ax.plot(t_nd_t[mask_t] / T, Pb_t[mask_t], "r-",
+            label="Текстура", lw=s["linewidth"])
+    _style_ax(ax, title="Нагрузка на ПК (последние 5 периодов)",
+              xlabel="t / T", ylabel="P(t), Н")
     fig.tight_layout()
     if save:
-        fig.savefig(f"{PLOT_DIR}/04_Pt.png", dpi=150)
+        fig.savefig(f"{PLOT_DIR}/04_Pt.png", dpi=s["dpi"])
     plt.close(fig)
 
 
 def plot_Peq_vs_epsilon(eps_arr, Peq_s, Peq_t, save=True):
     """P_eq vs ε."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(eps_arr, Peq_s, "b-o", label="Гладкий", markersize=5)
-    ax.plot(eps_arr, Peq_t, "r-s", label="Текстура", markersize=5)
-    ax.set_xlabel("ε")
-    ax.set_ylabel("P_eq, Н")
-    ax.set_title("Эквивалентная нагрузка vs ε")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    s = _PLOT_STYLE
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.plot(eps_arr, Peq_s, "b-o", label="Гладкий",
+            lw=s["linewidth"], ms=s["markersize"])
+    ax.plot(eps_arr, Peq_t, "r-s", label="Текстура",
+            lw=s["linewidth"], ms=s["markersize"])
+    _style_ax(ax, title="Эквивалентная нагрузка P_eq vs ε",
+              xlabel="ε", ylabel="P_eq, Н")
     fig.tight_layout()
     if save:
-        fig.savefig(f"{PLOT_DIR}/05_Peq_vs_epsilon.png", dpi=150)
+        fig.savefig(f"{PLOT_DIR}/05_Peq_vs_epsilon.png", dpi=s["dpi"])
     plt.close(fig)
 
 
 def plot_L10h_vs_epsilon(eps_arr, L10h_s, L10h_t, save=True):
     """L10h vs ε."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.semilogy(eps_arr, L10h_s, "b-o", label="Гладкий", markersize=5)
-    ax.semilogy(eps_arr, L10h_t, "r-s", label="Текстура", markersize=5)
-    ax.set_xlabel("ε")
-    ax.set_ylabel("L₁₀, часов")
-    ax.set_title("Ресурс L₁₀ vs ε")
-    ax.legend()
-    ax.grid(True, alpha=0.3, which="both")
+    s = _PLOT_STYLE
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.semilogy(eps_arr, L10h_s, "b-o", label="Гладкий",
+                lw=s["linewidth"], ms=s["markersize"])
+    ax.semilogy(eps_arr, L10h_t, "r-s", label="Текстура",
+                lw=s["linewidth"], ms=s["markersize"])
+    _style_ax(ax, title="Ресурс L₁₀ vs ε", xlabel="ε", ylabel="L₁₀, часов")
     fig.tight_layout()
     if save:
-        fig.savefig(f"{PLOT_DIR}/06_L10h_vs_epsilon.png", dpi=150)
+        fig.savefig(f"{PLOT_DIR}/06_L10h_vs_epsilon.png", dpi=s["dpi"])
     plt.close(fig)
 
 
 def plot_weibull(L10h_smooth, L10h_textured, save=True):
     """Кривые Вейбулла R(t) при ε₀."""
+    s = _PLOT_STYLE
     t_max_h = 5 * max(L10h_smooth, L10h_textured)
     t_hours = np.linspace(0, t_max_h, 1000)
     _, R_s = weibull_reliability(L10h_smooth, t_hours)
     _, R_t = weibull_reliability(L10h_textured, t_hours)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(t_hours, R_s, "b-", label="Гладкий")
-    ax.plot(t_hours, R_t, "r-", label="Текстура")
-    ax.axhline(0.9, color="gray", ls="--", alpha=0.5, label="R = 0.9 (L₁₀)")
-    ax.set_xlabel("t, часов")
-    ax.set_ylabel("R(t)")
-    ax.set_title(f"Надёжность по Вейбуллу (ε₀ = {epsilon0_operating})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.plot(t_hours, R_s, "b-", label="Гладкий", lw=s["linewidth"])
+    ax.plot(t_hours, R_t, "r-", label="Текстура", lw=s["linewidth"])
+    ax.axhline(0.9, color="gray", ls="--", alpha=0.5, lw=1.5, label="R = 0.9 (L₁₀)")
+    _style_ax(ax, title=f"Надёжность по Вейбуллу (ε₀ = {epsilon0_operating})",
+              xlabel="t, часов", ylabel="R(t)")
     fig.tight_layout()
     if save:
-        fig.savefig(f"{PLOT_DIR}/07_weibull.png", dpi=150)
+        fig.savefig(f"{PLOT_DIR}/07_weibull.png", dpi=s["dpi"])
     plt.close(fig)
 
 
 def plot_ratio_vs_epsilon(eps_arr, ratio_arr, save=True):
     """Отношение ресурсов L10_textured / L10_smooth vs ε."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(eps_arr, ratio_arr, "g-o", markersize=5)
-    ax.axhline(1.0, color="gray", ls="--", alpha=0.5)
-    ax.set_xlabel("ε")
-    ax.set_ylabel("L₁₀(текст.) / L₁₀(гладк.)")
-    ax.set_title("Отношение ресурсов: текстура / гладкий")
-    ax.grid(True, alpha=0.3)
+    s = _PLOT_STYLE
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.plot(eps_arr, ratio_arr, "g-o", lw=s["linewidth"], ms=s["markersize"])
+    ax.axhline(1.0, color="gray", ls="--", alpha=0.5, lw=1.5)
+    _style_ax(ax, title="Отношение ресурсов: текстура / гладкий",
+              xlabel="ε", ylabel="L₁₀(текст.) / L₁₀(гладк.)")
     fig.tight_layout()
     if save:
-        fig.savefig(f"{PLOT_DIR}/08_ratio_vs_epsilon.png", dpi=150)
+        fig.savefig(f"{PLOT_DIR}/08_ratio_vs_epsilon.png", dpi=s["dpi"])
     plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Сохранение / загрузка результатов
+# ──────────────────────────────────────────────────────────────────────
+
+def save_results(filepath, eps_arr, KC_smooth_nd, KC_textured_nd,
+                 stab_smooth, stab_textured,
+                 sol_s, sol_t,
+                 Pb_s, Pb_t,
+                 Peq_smooth_arr, Peq_textured_arr,
+                 L10h_smooth_arr, L10h_textured_arr,
+                 ratio_arr, sens_rows,
+                 Peq_s0, Peq_t0, L10h_s0, L10h_t0, ratio0,
+                 ratio_nc):
+    """Сохранить все результаты в .npz для последующей перегенерации графиков."""
+    # K,C как массивы словарей -> отдельные массивы по ключам
+    kc_keys = ["Kxx", "Kxy", "Kyx", "Kyy", "Cxx", "Cxy", "Cyx", "Cyy"]
+    kc_s = {k: np.array([d[k] for d in KC_smooth_nd]) for k in kc_keys}
+    kc_t = {k: np.array([d[k] for d in KC_textured_nd]) for k in kc_keys}
+
+    np.savez(
+        filepath,
+        epsilon_values=eps_arr,
+        # K,C coefficients
+        **{f"KC_smooth_{k}": v for k, v in kc_s.items()},
+        **{f"KC_textured_{k}": v for k, v in kc_t.items()},
+        # Stability
+        stab_smooth=np.array(stab_smooth),
+        stab_textured=np.array(stab_textured),
+        # Orbit (last 5 periods only — to keep file small)
+        sol_s_t=sol_s.t, sol_s_y=sol_s.y,
+        sol_t_t=sol_t.t, sol_t_y=sol_t.y,
+        # Bearing load
+        Pb_s=Pb_s, Pb_t=Pb_t,
+        # Sweep results
+        Peq_smooth_arr=np.array(Peq_smooth_arr),
+        Peq_textured_arr=np.array(Peq_textured_arr),
+        L10h_smooth_arr=np.array(L10h_smooth_arr),
+        L10h_textured_arr=np.array(L10h_textured_arr),
+        ratio_arr=np.array(ratio_arr),
+        # Sensitivity study
+        sens_K_pk=np.array([r["K_pk"] for r in sens_rows]),
+        sens_ratio=np.array([r["ratio"] for r in sens_rows]),
+        # Operating point values
+        Peq_s0=Peq_s0, Peq_t0=Peq_t0,
+        L10h_s0=L10h_s0, L10h_t0=L10h_t0,
+        ratio0=ratio0, ratio_nc=ratio_nc,
+    )
+    print(f"\nРезультаты сохранены в {filepath}")
+
+
+def load_and_plot(filepath):
+    """Загрузить .npz и перегенерировать все графики."""
+    print(f"Загрузка данных из {filepath}...")
+    d = np.load(filepath, allow_pickle=False)
+
+    eps_arr = d["epsilon_values"]
+
+    # Восстановить списки словарей K,C
+    kc_keys = ["Kxx", "Kxy", "Kyx", "Kyy", "Cxx", "Cxy", "Cyx", "Cyy"]
+    KC_smooth_nd = []
+    KC_textured_nd = []
+    n = len(eps_arr)
+    for i in range(n):
+        KC_smooth_nd.append({k: float(d[f"KC_smooth_{k}"][i]) for k in kc_keys})
+        KC_textured_nd.append({k: float(d[f"KC_textured_{k}"][i]) for k in kc_keys})
+
+    stab_smooth = [tuple(row) for row in d["stab_smooth"]]
+    stab_textured = [tuple(row) for row in d["stab_textured"]]
+
+    # Восстановить orbit как SimpleNamespace (duck-type для sol.t / sol.y)
+    from types import SimpleNamespace
+    sol_s = SimpleNamespace(t=d["sol_s_t"], y=d["sol_s_y"])
+    sol_t = SimpleNamespace(t=d["sol_t_t"], y=d["sol_t_y"])
+
+    Pb_s = d["Pb_s"]
+    Pb_t = d["Pb_t"]
+
+    Peq_smooth_arr = d["Peq_smooth_arr"]
+    Peq_textured_arr = d["Peq_textured_arr"]
+    L10h_smooth_arr = d["L10h_smooth_arr"]
+    L10h_textured_arr = d["L10h_textured_arr"]
+    ratio_arr = d["ratio_arr"]
+
+    L10h_s0 = float(d["L10h_s0"])
+    L10h_t0 = float(d["L10h_t0"])
+
+    sens_K_pk = d["sens_K_pk"]
+    sens_ratio = d["sens_ratio"]
+
+    # ─── Перегенерация графиков ───
+    print("Генерация графиков...")
+
+    plot_KC_vs_epsilon(eps_arr, KC_smooth_nd, KC_textured_nd)
+    plot_stability_vs_epsilon(eps_arr, stab_smooth, stab_textured)
+    plot_orbit(sol_s, sol_t)
+    plot_Pt(sol_s.t, Pb_s, sol_t.t, Pb_t)
+    plot_Peq_vs_epsilon(eps_arr, Peq_smooth_arr, Peq_textured_arr)
+    plot_L10h_vs_epsilon(eps_arr, L10h_smooth_arr, L10h_textured_arr)
+    plot_weibull(L10h_s0, L10h_t0)
+    plot_ratio_vs_epsilon(eps_arr, ratio_arr)
+
+    # Sensitivity study plot
+    s = _PLOT_STYLE
+    fig, ax = plt.subplots(figsize=s["figsize_single"])
+    ax.semilogx(sens_K_pk, sens_ratio, "ko-",
+                markersize=s["markersize"], lw=s["linewidth"])
+    _style_ax(ax,
+              title=f"Sensitivity study: ratio vs K_pk (ε₀ = {epsilon0_operating})",
+              xlabel="K_pk, Н/м",
+              ylabel="L₁₀(текст.) / L₁₀(гладк.)")
+    ax.set_ylim(0, max(sens_ratio) * 1.5)
+    fig.tight_layout()
+    fig.savefig(f"{PLOT_DIR}/09_sensitivity_Kpk.png", dpi=s["dpi"])
+    plt.close(fig)
+
+    print(f"Все графики сохранены в {PLOT_DIR}/")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1052,8 +1173,28 @@ def main():
         print("  Cxy/Cyx не влияют на ratio — их нестабильность не критична.")
 
     print(f"\nВсе графики сохранены в {PLOT_DIR}/")
+
+    # ─── Сохранение результатов для --plots-only ───
+    save_results(
+        DATA_FILE, epsilon_values, KC_smooth_nd, KC_textured_nd,
+        stab_smooth, stab_textured,
+        sol_s, sol_t,
+        Pb_s, Pb_t,
+        Peq_smooth_arr, Peq_textured_arr,
+        L10h_smooth_arr, L10h_textured_arr,
+        ratio_arr, _sens_rows,
+        Peq_s0, Peq_t0, L10h_s0, L10h_t0, ratio0,
+        ratio_nc,
+    )
+
     print("Пайплайн завершён.")
 
 
 if __name__ == "__main__":
-    main()
+    if "--plots-only" in sys.argv:
+        if not os.path.exists(DATA_FILE):
+            print(f"Файл {DATA_FILE} не найден. Сначала запустите полный расчёт.")
+            sys.exit(1)
+        load_and_plot(DATA_FILE)
+    else:
+        main()
