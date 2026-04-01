@@ -96,6 +96,16 @@ m_rotor = 1.0         # масса ротора, кг
 F0 = 1.0e4            # амплитуда внешней силы, Н
 Omega = omega_shaft    # возмущающая частота
 
+# --- Подшипник качения (ПК) — из каталога ---
+K_pk_xx = 1e8       # Жёсткость ПК по x, Н/м
+K_pk_yy = 1e8       # Жёсткость ПК по y, Н/м
+K_pk_xy = 0.0       # Перекрёстная жёсткость ПК
+K_pk_yx = 0.0
+C_pk_xx = 500.0     # Демпфирование ПК по x, Н·с/м
+C_pk_yy = 500.0     # Демпфирование ПК по y, Н·с/м
+C_pk_xy = 0.0
+C_pk_yx = 0.0
+
 # --- Параметры возмущений ---
 de = 5e-4             # для жёсткости
 dv_diag = 5e-4        # для Cxx, Cyy (диагональные — стабильны)
@@ -365,32 +375,43 @@ def compute_stability_params(Kxx, Kxy, Kyx, Kyy, Cxx, Cxy, Cyx, Cyy):
 # Этап 2: Интегрирование орбиты ротора
 # ──────────────────────────────────────────────────────────────────────
 
-def integrate_orbit(coef_nd, n_periods=40, pts_per_period=200):
+def integrate_orbit(coef_nd_ps, n_periods=40, pts_per_period=200):
     """
-    Линейная модель ротора:
-        m·ẍ = F_ext_x(t) - Kxx·x - Kxy·y - Cxx·ẋ - Cxy·ẏ
-        m·ÿ = F_ext_y(t) - Kyx·x - Kyy·y - Cyx·ẋ - Cyy·ẏ
+    Двухопорная модель ротора:
+        m·q̈ = F_ext − (K_ps + K_pk)·q − (C_ps + C_pk)·q̇
 
-    В безразмерном виде (t* = Ω·t, x* = x/c):
-        m_nd · x'' = F_nd·cos(t*) - K·x* - C·x*'
-
-    Returns
-    -------
-    sol : OdeSolution
+    coef_nd_ps — безразмерные K,C подшипника скольжения (зависят от текстуры).
+    K_pk, C_pk — размерные параметры подшипника качения (из конфига).
     """
     m_nd = m_rotor * Omega ** 2 / K_scale
     F_nd = F0 / (K_scale * c)
+
+    # Обезразмеривание ПК
+    Kpk_xx_nd = K_pk_xx / K_scale
+    Kpk_xy_nd = K_pk_xy / K_scale
+    Kpk_yx_nd = K_pk_yx / K_scale
+    Kpk_yy_nd = K_pk_yy / K_scale
+    Cpk_xx_nd = C_pk_xx / C_scale
+    Cpk_xy_nd = C_pk_xy / C_scale
+    Cpk_yx_nd = C_pk_yx / C_scale
+    Cpk_yy_nd = C_pk_yy / C_scale
+
+    # Суммарные коэффициенты (ПС + ПК)
+    Kxx_t = coef_nd_ps["Kxx"] + Kpk_xx_nd
+    Kxy_t = coef_nd_ps["Kxy"] + Kpk_xy_nd
+    Kyx_t = coef_nd_ps["Kyx"] + Kpk_yx_nd
+    Kyy_t = coef_nd_ps["Kyy"] + Kpk_yy_nd
+    Cxx_t = coef_nd_ps["Cxx"] + Cpk_xx_nd
+    Cxy_t = coef_nd_ps["Cxy"] + Cpk_xy_nd
+    Cyx_t = coef_nd_ps["Cyx"] + Cpk_yx_nd
+    Cyy_t = coef_nd_ps["Cyy"] + Cpk_yy_nd
 
     def rotor_ode(t_star, state):
         x, y, vx, vy = state
         Fx_ext = F_nd * np.cos(t_star)
         Fy_ext = 0.0
-        ax = (Fx_ext
-              - coef_nd["Kxx"] * x - coef_nd["Kxy"] * y
-              - coef_nd["Cxx"] * vx - coef_nd["Cxy"] * vy) / m_nd
-        ay = (Fy_ext
-              - coef_nd["Kyx"] * x - coef_nd["Kyy"] * y
-              - coef_nd["Cyx"] * vx - coef_nd["Cyy"] * vy) / m_nd
+        ax = (Fx_ext - Kxx_t * x - Kxy_t * y - Cxx_t * vx - Cxy_t * vy) / m_nd
+        ay = (Fy_ext - Kyx_t * x - Kyy_t * y - Cyx_t * vx - Cyy_t * vy) / m_nd
         return [vx, vy, ax, ay]
 
     t_max = n_periods * 2 * np.pi
@@ -408,20 +429,27 @@ def integrate_orbit(coef_nd, n_periods=40, pts_per_period=200):
 # Собственные значения системы (проверка устойчивости)
 # ──────────────────────────────────────────────────────────────────────
 
-def compute_eigenvalues(coef_nd):
+def compute_eigenvalues(coef_nd_ps):
     """
-    Собственные значения линейной системы ротора.
-    Матрица системы 4x4: state = [x, y, vx, vy]
+    Собственные значения двухопорной линейной системы.
+    Суммарные K,C = K_ps + K_pk, C_ps + C_pk.
     """
     m_nd = m_rotor * Omega ** 2 / K_scale
+
+    Kxx_t = coef_nd_ps["Kxx"] + K_pk_xx / K_scale
+    Kxy_t = coef_nd_ps["Kxy"] + K_pk_xy / K_scale
+    Kyx_t = coef_nd_ps["Kyx"] + K_pk_yx / K_scale
+    Kyy_t = coef_nd_ps["Kyy"] + K_pk_yy / K_scale
+    Cxx_t = coef_nd_ps["Cxx"] + C_pk_xx / C_scale
+    Cxy_t = coef_nd_ps["Cxy"] + C_pk_xy / C_scale
+    Cyx_t = coef_nd_ps["Cyx"] + C_pk_yx / C_scale
+    Cyy_t = coef_nd_ps["Cyy"] + C_pk_yy / C_scale
 
     A_sys = np.array([
         [0, 0, 1, 0],
         [0, 0, 0, 1],
-        [-coef_nd["Kxx"] / m_nd, -coef_nd["Kxy"] / m_nd,
-         -coef_nd["Cxx"] / m_nd, -coef_nd["Cxy"] / m_nd],
-        [-coef_nd["Kyx"] / m_nd, -coef_nd["Kyy"] / m_nd,
-         -coef_nd["Cyx"] / m_nd, -coef_nd["Cyy"] / m_nd],
+        [-Kxx_t / m_nd, -Kxy_t / m_nd, -Cxx_t / m_nd, -Cxy_t / m_nd],
+        [-Kyx_t / m_nd, -Kyy_t / m_nd, -Cyx_t / m_nd, -Cyy_t / m_nd],
     ])
 
     eigs = np.linalg.eigvals(A_sys)
@@ -432,24 +460,26 @@ def compute_eigenvalues(coef_nd):
 # Этап 3: Нагрузка на опору P(t)
 # ──────────────────────────────────────────────────────────────────────
 
-def compute_bearing_load(sol, coef_dim):
+def compute_bearing_load_pk(sol):
     """
-    Из орбиты → реакция опоры P(t).
+    Нагрузка на подшипник КАЧЕНИЯ (ПК):
+        F_pk(t) = K_pk · q(t) + C_pk · q̇(t)
 
-    x_dim = x_nd * c, xdot_dim = vx_nd * c * Omega
+    Используются фиксированные K_pk, C_pk из конфига (не зависят от текстуры).
+    Текстура влияет на q(t) через изменение K_ps, C_ps в уравнении движения.
     """
     x_dim = sol.y[0] * c
     y_dim = sol.y[1] * c
     xdot_dim = sol.y[2] * c * Omega
     ydot_dim = sol.y[3] * c * Omega
 
-    Fx_b = (coef_dim["Kxx"] * x_dim + coef_dim["Kxy"] * y_dim
-            + coef_dim["Cxx"] * xdot_dim + coef_dim["Cxy"] * ydot_dim)
-    Fy_b = (coef_dim["Kyx"] * x_dim + coef_dim["Kyy"] * y_dim
-            + coef_dim["Cyx"] * xdot_dim + coef_dim["Cyy"] * ydot_dim)
+    Fx_pk = (K_pk_xx * x_dim + K_pk_xy * y_dim
+             + C_pk_xx * xdot_dim + C_pk_xy * ydot_dim)
+    Fy_pk = (K_pk_yx * x_dim + K_pk_yy * y_dim
+             + C_pk_yx * xdot_dim + C_pk_yy * ydot_dim)
 
-    P_bearing = np.sqrt(Fx_b ** 2 + Fy_b ** 2)
-    return P_bearing, Fx_b, Fy_b
+    P_pk = np.sqrt(Fx_pk ** 2 + Fy_pk ** 2)
+    return P_pk, Fx_pk, Fy_pk
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -688,8 +718,6 @@ def main():
     # Sweep по ε
     KC_smooth_nd = []
     KC_textured_nd = []
-    KC_smooth_dim = []
-    KC_textured_dim = []
     stab_smooth = []
     stab_textured = []
 
@@ -697,10 +725,9 @@ def main():
         print(f"\n  ε = {eps:.2f} ({i + 1}/{len(epsilon_values)})")
 
         # Гладкий
-        coef_nd_s, coef_dim_s, diags_s = compute_KC(eps, with_depressions=False)
+        coef_nd_s, _, diags_s = compute_KC(eps, with_depressions=False)
         ok_s = sanity_check_KC(coef_nd_s, label=f"smooth ε={eps:.2f}")
         KC_smooth_nd.append(coef_nd_s)
-        KC_smooth_dim.append(coef_dim_s)
 
         sp_s = compute_stability_params(**{k: coef_nd_s[k] for k in coef_nd_s})
         stab_smooth.append(sp_s)
@@ -710,10 +737,9 @@ def main():
               f"{'OK' if ok_s else 'WARN'}")
 
         # Текстурированный
-        coef_nd_t, coef_dim_t, diags_t = compute_KC(eps, with_depressions=True)
+        coef_nd_t, _, diags_t = compute_KC(eps, with_depressions=True)
         ok_t = sanity_check_KC(coef_nd_t, label=f"textured ε={eps:.2f}")
         KC_textured_nd.append(coef_nd_t)
-        KC_textured_dim.append(coef_dim_t)
 
         sp_t = compute_stability_params(**{k: coef_nd_t[k] for k in coef_nd_t})
         stab_textured.append(sp_t)
@@ -733,8 +759,6 @@ def main():
     idx0 = np.argmin(np.abs(epsilon_values - epsilon0_operating))
     coef_nd_s0 = KC_smooth_nd[idx0]
     coef_nd_t0 = KC_textured_nd[idx0]
-    coef_dim_s0 = KC_smooth_dim[idx0]
-    coef_dim_t0 = KC_textured_dim[idx0]
 
     # Собственные значения (устойчивость)
     print(f"\n>>> Собственные значения при ε₀ = {epsilon0_operating}")
@@ -745,7 +769,7 @@ def main():
     print(f"  Текстура: {eigs_t}")
     print(f"  Re(λ) < 0: {np.all(np.real(eigs_t) < 0)}")
 
-    # Этап 2: Орбита
+    # Этап 2: Орбита (двухопорная модель: ПС + ПК)
     print(f"\n>>> ЭТАП 2: Интегрирование орбиты (ε₀ = {epsilon0_operating})")
     sol_s = integrate_orbit(coef_nd_s0)
     sol_t = integrate_orbit(coef_nd_t0)
@@ -753,10 +777,10 @@ def main():
     print(f"  Текстура: t_max = {sol_t.t[-1]:.1f}, точек = {len(sol_t.t)}")
     plot_orbit(sol_s, sol_t)
 
-    # Этап 3: P(t) при ε₀
-    print(f"\n>>> ЭТАП 3: Нагрузка на опору (ε₀ = {epsilon0_operating})")
-    Pb_s, _, _ = compute_bearing_load(sol_s, coef_dim_s0)
-    Pb_t, _, _ = compute_bearing_load(sol_t, coef_dim_t0)
+    # Этап 3: Нагрузка на подшипник КАЧЕНИЯ (ПК)
+    print(f"\n>>> ЭТАП 3: Нагрузка на ПК (ε₀ = {epsilon0_operating})")
+    Pb_s, _, _ = compute_bearing_load_pk(sol_s)
+    Pb_t, _, _ = compute_bearing_load_pk(sol_t)
     plot_Pt(sol_s.t, Pb_s, sol_t.t, Pb_t)
 
     P_max_s = np.max(Pb_s)
@@ -806,16 +830,14 @@ def main():
 
         coef_nd_s_i = KC_smooth_nd[i]
         coef_nd_t_i = KC_textured_nd[i]
-        coef_dim_s_i = KC_smooth_dim[i]
-        coef_dim_t_i = KC_textured_dim[i]
 
-        # Орбита
+        # Орбита (двухопорная)
         sol_si = integrate_orbit(coef_nd_s_i)
         sol_ti = integrate_orbit(coef_nd_t_i)
 
-        # P(t)
-        Pb_si, _, _ = compute_bearing_load(sol_si, coef_dim_s_i)
-        Pb_ti, _, _ = compute_bearing_load(sol_ti, coef_dim_t_i)
+        # Нагрузка на ПК
+        Pb_si, _, _ = compute_bearing_load_pk(sol_si)
+        Pb_ti, _, _ = compute_bearing_load_pk(sol_ti)
 
         # P_eq
         Peq_si = compute_Peq(Pb_si, sol_si.t)
