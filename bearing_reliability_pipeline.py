@@ -109,7 +109,8 @@ C_pk_yx = 0.0
 # --- Параметры возмущений ---
 de = 5e-4             # для жёсткости
 dv_diag = 5e-4        # для Cxx, Cyy (диагональные — стабильны)
-dv_cross = 5e-2       # для Cxy, Cyx (перекрёстные — нужен больший шаг)
+dv_cyx = 5e-2         # для Cyx (стабилен при 5e-2)
+dv_cxy = 1e-1         # для Cxy (требует большего шага)
 
 # --- Диапазон эксцентриситетов ---
 epsilon_values = np.linspace(0.2, 0.8, 10)
@@ -193,23 +194,23 @@ def solver_adapter(ex, ey, exdot_star=0.0, eydot_star=0.0,
 # ──────────────────────────────────────────────────────────────────────
 
 def compute_KC(epsilon, with_depressions=False, de_val=None,
-               dv_diag_val=None, dv_cross_val=None):
+               dv_diag_val=None, dv_cyx_val=None, dv_cxy_val=None):
     """
     Вычислить 8 коэффициентов жёсткости и демпфирования.
 
-    Конвенция знаков (восстанавливающие):
-        K_ij = -dF_i / dq_j
-        C_ij = -dF_i / dq̇_j
-
-    Используются раздельные шаги dv для диагональных (Cxx, Cyy)
-    и перекрёстных (Cxy, Cyx) коэффициентов демпфирования.
+    Раздельные шаги:
+      dv_diag — Cxx, Cyy (малый, стабильны)
+      dv_cyx  — Cyx (средний, стабилен при 5e-2)
+      dv_cxy  — Cxy (большой, требует ~1e-1)
     """
     if de_val is None:
         de_val = de
     if dv_diag_val is None:
         dv_diag_val = dv_diag
-    if dv_cross_val is None:
-        dv_cross_val = dv_cross
+    if dv_cyx_val is None:
+        dv_cyx_val = dv_cyx
+    if dv_cxy_val is None:
+        dv_cxy_val = dv_cxy
 
     ex0 = epsilon
     ey0 = 0.0
@@ -239,11 +240,11 @@ def compute_KC(epsilon, with_depressions=False, de_val=None,
     diags.extend([d5, d6])
     Cxx_star = -(Fx_p - Fx_m) / (2 * dv_diag_val)
 
-    # Cyx: перекрёстный отклик Fy на ėx
-    Fx_p2, Fy_p2, d5c = solver_adapter(ex0, ey0, exdot_star=+dv_cross_val, with_depressions=with_depressions)
-    Fx_m2, Fy_m2, d6c = solver_adapter(ex0, ey0, exdot_star=-dv_cross_val, with_depressions=with_depressions)
+    # Cyx: перекрёстный отклик Fy на ėx (dv_cyx)
+    Fx_p2, Fy_p2, d5c = solver_adapter(ex0, ey0, exdot_star=+dv_cyx_val, with_depressions=with_depressions)
+    Fx_m2, Fy_m2, d6c = solver_adapter(ex0, ey0, exdot_star=-dv_cyx_val, with_depressions=with_depressions)
     diags.extend([d5c, d6c])
-    Cyx_star = -(Fy_p2 - Fy_m2) / (2 * dv_cross_val)
+    Cyx_star = -(Fy_p2 - Fy_m2) / (2 * dv_cyx_val)
     print(f"    Cyx debug: Fy(+dv)={Fy_p2:.6e}, Fy(-dv)={Fy_m2:.6e}, "
           f"diff={Fy_p2 - Fy_m2:.6e}, delta+={d5c['delta']:.2e}, delta-={d6c['delta']:.2e}")
 
@@ -254,11 +255,11 @@ def compute_KC(epsilon, with_depressions=False, de_val=None,
     diags.extend([d7, d8])
     Cyy_star = -(Fy_p - Fy_m) / (2 * dv_diag_val)
 
-    # Cxy: перекрёстный отклик Fx на ėy
-    Fx_p2, Fy_p2, d7c = solver_adapter(ex0, ey0, eydot_star=+dv_cross_val, with_depressions=with_depressions)
-    Fx_m2, Fy_m2, d8c = solver_adapter(ex0, ey0, eydot_star=-dv_cross_val, with_depressions=with_depressions)
+    # Cxy: перекрёстный отклик Fx на ėy (dv_cxy)
+    Fx_p2, Fy_p2, d7c = solver_adapter(ex0, ey0, eydot_star=+dv_cxy_val, with_depressions=with_depressions)
+    Fx_m2, Fy_m2, d8c = solver_adapter(ex0, ey0, eydot_star=-dv_cxy_val, with_depressions=with_depressions)
     diags.extend([d7c, d8c])
-    Cxy_star = -(Fx_p2 - Fx_m2) / (2 * dv_cross_val)
+    Cxy_star = -(Fx_p2 - Fx_m2) / (2 * dv_cxy_val)
     print(f"    Cxy debug: Fx(+dv)={Fx_p2:.6e}, Fx(-dv)={Fx_m2:.6e}, "
           f"diff={Fx_p2 - Fx_m2:.6e}, delta+={d7c['delta']:.2e}, delta-={d8c['delta']:.2e}")
 
@@ -333,9 +334,11 @@ def sanity_check_KC(coef_nd, label=""):
 def check_delta_stability(epsilon, with_depressions=False):
     """Проверить, что коэффициенты устойчивы к изменению δ в 2 раза."""
     coef1, _, _ = compute_KC(epsilon, with_depressions=with_depressions,
-                             de_val=de, dv_diag_val=dv_diag, dv_cross_val=dv_cross)
+                             de_val=de, dv_diag_val=dv_diag,
+                             dv_cyx_val=dv_cyx, dv_cxy_val=dv_cxy)
     coef2, _, _ = compute_KC(epsilon, with_depressions=with_depressions,
-                             de_val=de / 2, dv_diag_val=dv_diag / 2, dv_cross_val=dv_cross / 2)
+                             de_val=de / 2, dv_diag_val=dv_diag / 2,
+                             dv_cyx_val=dv_cyx / 2, dv_cxy_val=dv_cxy / 2)
 
     print(f"\n{'='*60}")
     print(f"Проверка стабильности δ (ε={epsilon}, text={'да' if with_depressions else 'нет'})")
@@ -1016,9 +1019,37 @@ def main():
     sens_ratios = [r["ratio"] for r in _sens_rows]
     print(f"  Ratio не зависит от выбора K_pk: {min(sens_ratios):.3f}–{max(sens_ratios):.3f} "
           f"(sensitivity study, K_pk = {K_pk_variants[0]:.0e}–{K_pk_variants[-1]:.0e})")
-    print("  Текстурирование увеличивает Kxx и снижает Cxx,")
-    print("  что коррелирует с ростом вибрационного отклика и нагрузки на ПК.")
+    print("  В большинстве исследованных точек текстурирование сопровождается")
+    print("  ростом Kxx и снижением Cxx, что коррелирует с увеличением")
+    print("  вибрационного отклика и нагрузки на ПК.")
+    print("  При ε = 0.40–0.47 наблюдается локальное отклонение Kxx,")
+    print("  предположительно связанное с перестройкой зоны кавитации.")
     print("  Абсолютные L10h зависят от параметров ПК (см. sensitivity study).")
+
+    # ─── Тест чувствительности к Cxy ───
+    # Если Cxy нестабилен, проверяем: влияет ли он на ratio?
+    coef_s0_noCxy = dict(coef_nd_s0)
+    coef_s0_noCxy["Cxy"] = 0.0
+    coef_s0_noCxy["Cyx"] = 0.0
+    coef_t0_noCxy = dict(coef_nd_t0)
+    coef_t0_noCxy["Cxy"] = 0.0
+    coef_t0_noCxy["Cyx"] = 0.0
+    sol_s_nc = integrate_orbit(coef_s0_noCxy)
+    sol_t_nc = integrate_orbit(coef_t0_noCxy)
+    Pb_s_nc, _, _ = compute_bearing_load_pk(sol_s_nc)
+    Pb_t_nc, _, _ = compute_bearing_load_pk(sol_t_nc)
+    Peq_s_nc = compute_Peq(Pb_s_nc, sol_s_nc.t)
+    Peq_t_nc = compute_Peq(Pb_t_nc, sol_t_nc.t)
+    _, L10h_s_nc = compute_L10(Peq_s_nc)
+    _, L10h_t_nc = compute_L10(Peq_t_nc)
+    ratio_nc = L10h_t_nc / L10h_s_nc if L10h_s_nc > 0 else np.inf
+    print(f"\n>>> Тест чувствительности к Cxy/Cyx (ε₀ = {epsilon0_operating}):")
+    print(f"  С Cxy/Cyx:  ratio = {ratio0:.3f}")
+    print(f"  Без Cxy/Cyx: ratio = {ratio_nc:.3f}")
+    diff_pct = abs(ratio_nc - ratio0) / abs(ratio0) * 100 if abs(ratio0) > 0 else 0
+    print(f"  Разница: {diff_pct:.2f}%")
+    if diff_pct < 1:
+        print("  Cxy/Cyx не влияют на ratio — их нестабильность не критична.")
 
     print(f"\nВсе графики сохранены в {PLOT_DIR}/")
     print("Пайплайн завершён.")
